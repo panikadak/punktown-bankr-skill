@@ -654,7 +654,7 @@ for (const forbidden of [
 }
 
 // Bankr's public skill format: frontmatter identity/discovery fields plus the
-// standalone catalog/install linkage must stay internally consistent.
+// standalone or curated catalog/install linkage must stay internally consistent.
 const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ?? "";
 equal("Bankr frontmatter name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "punktown");
 check("Bankr frontmatter description", /^description:\s*\S.+$/m.test(frontmatter));
@@ -664,9 +664,14 @@ equal("Bankr frontmatter visibility", frontmatter.match(/^visibility:\s*(\S+)$/m
 if (catalog) {
   equal("catalog slug matches skill name", catalog.slug, "punktown");
   equal("catalog schema version", catalog.schemaVersion, 1);
-  check("catalog installs public standalone repo", catalog.install?.type === "bankr"
+  equal("catalog provider", catalog.provider, "Bario Entertainment System");
+  const installsStandaloneRepo = catalog.install?.type === "bankr"
     && catalog.install?.repoPath === "."
-    && catalog.install?.command === "install the skill at https://github.com/panikadak/punktown-bankr-skill");
+    && catalog.install?.command === "install the skill at https://github.com/panikadak/punktown-bankr-skill";
+  const installsCuratedRepo = catalog.install?.type === "bankr"
+    && catalog.install?.repoPath === "punktown"
+    && catalog.install?.command === "install the punktown skill from https://github.com/BankrBot/skills/tree/main/punktown";
+  check("catalog installs a reviewed public source", installsStandaloneRepo || installsCuratedRepo);
 } else {
   check("optional source-catalog metadata may be absent from an installed Bankr resource bundle", true);
 }
