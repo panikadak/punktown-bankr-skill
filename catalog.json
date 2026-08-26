@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "slug": "punktown",
+  "provider": "Punk Town",
+  "providerUrl": "https://punk.town",
+  "logo": "logo.svg",
+  "demo": {
+    "title": "punktown-bankr-session.txt",
+    "language": "text",
+    "code": "You:   Show my Punk Town crew and rewards\nBankr: You have 2 active Crew positions and claimable AAPLc + GOOGLc.\n       Position #42 is Surge; position #57 is Maximum.\n\nYou:   Settle everything and claim it to my Bankr wallet\nBankr: Settle positions #42 and #57 to your beneficiary credit on Base? (yes/no)\nYou:   yes\nBankr: Settled. Next fresh step: claim 14.82 AAPLc to 0xYourBankrWallet? (yes/no)\nYou:   yes\nBankr: Claimed 14.82 AAPLc. GOOGLc is the next separately confirmed step.\n       Tx: basescan.org/tx/0x…"
+  },
+  "setup": [
+    "Install the skill from the public GitHub repository URL",
+    "Use the active Bankr EVM wallet on Base; never paste or expose a private key",
+    "Keep Wallet API read-write access and arbitrary contract calls enabled for writes",
+    "Run the bundled live self-test once after install or update",
+    "Every write verifies the pinned deployment, emits one unsigned transaction, confirms that fresh step, and waits for a mined successful receipt before continuing"
+  ],
+  "install": {
+    "type": "bankr",
+    "repoPath": ".",
+    "command": "install the skill at https://github.com/panikadak/punktown-bankr-skill"
+  }
+}

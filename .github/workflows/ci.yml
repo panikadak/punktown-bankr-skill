@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-policy-and-codec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Syntax check
+        run: |
+          node --check scripts/punktown.mjs
+          node --check scripts/selftest.mjs
+          node --check scripts/fork-cli-test.mjs
+      - name: Offline policy and ABI tests
+        run: node scripts/selftest.mjs
+      - name: Parse shipped JSON
+        run: |
+          jq empty catalog.json
+          jq empty references/deployment.json
+          jq empty references/signing-allowlist.json

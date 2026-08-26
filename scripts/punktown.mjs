@@ -1,0 +1,1994 @@
+#!/usr/bin/env node
+// Punk Town planner for Bankr. Reads Base mainnet, verifies the reviewed live
+// deployment, and emits unsigned allowlisted transactions. It never signs or submits.
+
+import {
+  asciiBytes32,
+  decodeCallArguments,
+  decodeAddress,
+  decodeBytes32,
+  decodePosition,
+  decodeUint,
+  encodeCall,
+  formatUnits,
+  jsonValue,
+  normalizeAddress,
+  parseUnits,
+  stripErc8021Suffix,
+} from "./lib/abi.mjs";
+import {
+  estimateGas,
+  ethCall,
+  getCode,
+  getReceipt,
+  getTransaction,
+  latestBlock,
+  revertData,
+  txSelector,
+  unsignedTx,
+} from "./lib/chain.mjs";
+import { keccak256 } from "./lib/keccak256.mjs";
+import {
+  ADDR,
+  BUY_TOTAL,
+  DEPLOYMENT,
+  EVENT_BY_TOPIC,
+  FEE,
+  MAX_BATCH,
+  MAX_CONVERT,
+  MIN_CONVERT,
+  SELL_PAYOUT,
+  SIG,
+  TIERS,
+  ZERO_ADDRESS,
+  allPositions,
+  call,
+  describeRevert,
+  distributedTokens,
+  inventoryPage,
+  knownActionBySelector,
+  protocolStatus,
+  readAddress,
+  readBool,
+  readTokenMeta,
+  readUint,
+  verifyDeployment,
+  walletCrew,
+  walletRewards,
+} from "./lib/protocol.mjs";
+
+const [, , command, ...argv] = process.argv;
+const args = {};
+let argumentParseError = null;
+for (let index = 0; index < argv.length; index += 1) {
+  const flag = argv[index];
+  if (!flag.startsWith("--")) {
+    argumentParseError = `unexpected positional argument: ${flag}`;
+    break;
+  }
+  const key = flag.slice(2);
+  if (!key || Object.hasOwn(args, key)) {
+    argumentParseError = !key ? "empty -- flag is not allowed" : `duplicate flag: --${key}`;
+    break;
+  }
+  const next = argv[index + 1];
+  if (next !== undefined && !next.startsWith("--")) {
+    args[key] = next;
+    index += 1;
+  } else {
+    args[key] = true;
+  }
+}
+
+class GateError extends Error {
+  constructor(gate, detail, extra = {}) {
+    super(detail);
+    this.gate = gate;
+    this.extra = extra;
+  }
+}
+
+function gate(condition, name, detail, extra = {}) {
+  if (!condition) throw new GateError(name, detail, extra);
+}
+
+function need(name) {
+  const value = args[name];
+  gate(value !== undefined && value !== true, "args", `--${name} is required`);
+  return value;
+}
+
+function integerArg(name, { min = 0n, max = (1n << 256n) - 1n, required = true } = {}) {
+  const raw = required ? need(name) : args[name];
+  if (raw === undefined) return null;
+  gate(/^[0-9]+$/.test(String(raw)), "args", `--${name} must be a non-negative integer`);
+  const value = BigInt(raw);
+  gate(value >= min && value <= max, "args", `--${name} must be between ${min} and ${max}`);
+  return value;
+}
+
+function walletArg() {
+  return normalizeAddress(need("wallet"));
+}
+
+function recipientArg(wallet) {
+  return args.recipient ? normalizeAddress(args.recipient) : wallet;
+}
+
+function tokenArg(name = "token") {
+  return normalizeAddress(need(name));
+}
+
+function tokenListArg() {
+  const tokens = need("tokens").split(",").map((token) => normalizeAddress(token.trim()));
+  const unique = [...new Set(tokens)];
+  gate(unique.length > 0 && unique.length <= MAX_BATCH, "args", `--tokens must contain 1..${MAX_BATCH} unique addresses`);
+  return unique;
+}
+
+function amountArg(name, decimals) {
+  const value = parseUnits(need(name), decimals);
+  gate(value > 0n, "args", `--${name} must be greater than zero`);
+  return value;
+}
+
+function out(value, code = 0) {
+  console.log(JSON.stringify(jsonValue(value), null, 2));
+  process.exitCode = code;
+}
+
+async function deploymentGate() {
+  const integrity = await verifyDeployment();
+  gate(integrity.ok, "deployment-integrity", "live Base deployment did not match the reviewed release pin", {
+    failed: integrity.failed,
+  });
+  return { ok: true, commit: DEPLOYMENT.release.commit, blocks: DEPLOYMENT.release.blocks };
+}
+
+async function routeGate(kind) {
+  if (kind === "fee") {
+    const [active, paused] = await Promise.all([
+      readBool(ADDR.routeRegistry, "feeRouteActive()"),
+      readBool(ADDR.routeRegistry, "feeRoutePaused()"),
+    ]);
+    gate(active && !paused, "fee-route", "the fee route must be active and unpaused for buy/sell");
+    return { active, paused };
+  }
+  if (kind === "stock") {
+    const paused = await readBool(ADDR.routeRegistry, "stockRoutePaused()");
+    gate(!paused, "stock-route", "the stock route is paused; stake, upgrade, and convert are unavailable");
+    return { paused };
+  }
+  return null;
+}
+
+async function simulation(tx, wallet) {
+  try {
+    const result = await ethCall(tx.to, tx.data, wallet);
+    const gas = await estimateGas(tx.to, tx.data, wallet, "0x0");
+    return { ok: true, returnData: result, gasEstimate: gas };
+  } catch (error) {
+    const data = revertData(error);
+    throw new GateError("simulation", data ? describeRevert(data) : error.message, {
+      revertSelector: data?.slice(0, 10) ?? null,
+    });
+  }
+}
+
+function confirmationKey(action, terms) {
+  return keccak256(JSON.stringify(jsonValue({ chainId: 8453, action, terms })));
+}
+
+function normalizedUintString(value, label) {
+  try {
+    const parsed = BigInt(value);
+    gate(parsed >= 0n, "args", `${label} must be a non-negative integer`);
+    return parsed.toString();
+  } catch (error) {
+    if (error instanceof GateError) throw error;
+    throw new GateError("args", `${label} must be a non-negative integer`);
+  }
+}
+
+function encodeInspectionContext(action, terms) {
+  const context = jsonValue({ action, terms });
+  const encoded = new TextEncoder().encode(JSON.stringify(context));
+  gate(encoded.length <= 65_536, "planner", "inspection context exceeds 64 KiB");
+  return {
+    context,
+    hex: `0x${Array.from(encoded, (byte) => byte.toString(16).padStart(2, "0")).join("")}`,
+  };
+}
+
+function decodeInspectionContext(value) {
+  gate(typeof value === "string" && /^0x(?:[0-9a-fA-F]{2})+$/.test(value), "args", "--context must be non-empty UTF-8 JSON encoded as hex");
+  const hex = value.slice(2);
+  gate(hex.length <= 65_536 * 2, "args", "--context exceeds 64 KiB");
+  let raw;
+  try {
+    raw = new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(hex.match(/.{2}/g).map((byte) => Number.parseInt(byte, 16))),
+    );
+  } catch {
+    throw new GateError("args", "--context is not valid UTF-8");
+  }
+  let context;
+  try {
+    context = JSON.parse(raw);
+  } catch {
+    throw new GateError("args", "--context is not valid JSON");
+  }
+  gate(context && typeof context === "object" && !Array.isArray(context), "args", "--context must decode to an object");
+  gate(typeof context.action === "string" && context.terms && typeof context.terms === "object" && !Array.isArray(context.terms), "args", "--context must contain action and terms");
+  gate(JSON.stringify(context) === raw, "args", "--context JSON is not in the planner's canonical form");
+  return { context, hex: `0x${hex.toLowerCase()}` };
+}
+
+function inspectionKey(wallet, tx, contextHex) {
+  return keccak256(JSON.stringify({
+    chainId: Number(BigInt(tx.chainId)),
+    wallet: normalizeAddress(wallet),
+    to: normalizeAddress(tx.to),
+    data: tx.data.toLowerCase(),
+    value: normalizedUintString(tx.value, "transaction value"),
+    context: contextHex.toLowerCase(),
+  }));
+}
+
+async function finalPlan({ action, wallet, tx, terms, report, expectedEvents, postconditions, warnings = [], reads = {} }) {
+  const preflight = await simulation(tx, wallet);
+  const inspection = encodeInspectionContext(action, terms);
+  return {
+    ok: true,
+    command,
+    phase: "action",
+    deployment: { commit: DEPLOYMENT.release.commit, integrity: true },
+    wallet,
+    reads,
+    terms,
+    confirmationKey: confirmationKey(action, terms),
+    inspectionContext: inspection.context,
+    inspectionContextHex: inspection.hex,
+    inspectionKey: inspectionKey(wallet, tx, inspection.hex),
+    report,
+    warnings,
+    txs: [tx],
+    preflight: { ...preflight, returnData: preflight.returnData || "0x" },
+    expectedEvents,
+    postconditions,
+    submitRule: "Show the report and terms. Use an existing explicit confirmation only when it covers this exact confirmationKey and unchanged terms; otherwise obtain confirmation. Re-run immediately before submission, require the same confirmationKey, then submit this one tx with waitForConfirmation=true. Require a successful receipt and postconditions. Never replay an unknown outcome.",
+  };
+}
+
+async function approvalPlan({ action, wallet, approvals, after, terms, report, warnings = [], reads = {} }) {
+  gate(approvals.length === 1, "planner", "approval planner must emit exactly one transaction per fresh plan");
+  gate(terms && report, "planner", "approval plan must carry the full action terms and confirmation report");
+  const preflights = [];
+  for (const tx of approvals) preflights.push(await simulation(tx, wallet));
+  const inspection = encodeInspectionContext(action, terms);
+  return {
+    ok: true,
+    command,
+    phase: "approval",
+    deployment: { commit: DEPLOYMENT.release.commit, integrity: true },
+    wallet,
+    reads,
+    terms,
+    confirmationKey: confirmationKey(action, terms),
+    inspectionContext: inspection.context,
+    inspectionContextHex: inspection.hex,
+    report,
+    warnings,
+    txs: approvals,
+    inspectionKey: inspectionKey(wallet, approvals[0], inspection.hex),
+    preflights,
+    expectedEvents: ["Approval"],
+    next: `${after}. After the user confirms the full report, submit this scoped approval only, with waitForConfirmation=true. Require success, then re-run the planner from fresh chain state. Continue without another prompt only if the confirmationKey and all confirmed economic terms remain unchanged. Do not submit an action from this stale plan.`,
+  };
+}
+
+async function erc20Approval(token, spender, required, wallet, label) {
+  const [balance, allowance] = await Promise.all([
+    readUint(token, SIG.balanceOf, ["address"], [wallet]),
+    readUint(token, SIG.allowance, ["address", "address"], [wallet, spender]),
+  ]);
+  gate(balance >= required, "balance", `${label}: wallet balance is below the exact required amount`, {
+    balance, required,
+  });
+  if (allowance === required) return { tx: null, balance, allowance };
+  const approvalAmount = allowance === 0n ? required : 0n;
+  return {
+    tx: unsignedTx(
+      token,
+      encodeCall(SIG.approve, ["address", "uint256"], [spender, approvalAmount]),
+      approvalAmount === 0n ? `reset mismatched allowance to zero: ${label}` : `exact approve: ${label}`,
+    ),
+    balance,
+    allowance,
+    approvalAmount,
+  };
+}
+
+async function nftApproval(spender, tokenId, wallet, label) {
+  let owner;
+  try {
+    owner = await readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [tokenId]);
+  } catch {
+    throw new GateError("ownership", `Bario Punk #${tokenId} does not exist or ownerOf reverted`);
+  }
+  gate(owner === wallet, "ownership", `Bario Punk #${tokenId} is not owned by the active Bankr wallet`, { owner, wallet });
+  const approved = await readAddress(ADDR.punks, SIG.getApproved, ["uint256"], [tokenId]);
+  if (approved === normalizeAddress(spender)) return { tx: null, owner, approved };
+  return {
+    tx: unsignedTx(ADDR.punks, encodeCall(SIG.approve, ["address", "uint256"], [spender, tokenId]), `token-specific approve: ${label}`),
+    owner,
+    approved,
+  };
+}
+
+async function feeQuote(wallet) {
+  const slippageBps = args["slippage-bps"] === undefined ? 300n : integerArg("slippage-bps", { min: 1n, max: 1000n });
+  const quote = decodeUint(await call(ADDR.feeRouter, "quoteExactBAESForWETH(uint256)", ["uint256"], [FEE], wallet));
+  gate(quote > 0n, "quote", "fee adapter returned a zero WETH quote");
+  const minWethOut = quote * (10_000n - slippageBps) / 10_000n;
+  gate(minWethOut > 0n, "quote", "computed minWethOut is zero");
+  const block = await latestBlock();
+  return { quote, minWethOut, slippageBps, deadline: block.timestamp + 600n, quoteBlock: block.number };
+}
+
+async function getPosition(positionId) {
+  const position = decodePosition(await call(ADDR.lockVault, "positions(uint256)", ["uint256"], [positionId]));
+  gate(position.beneficiary !== ZERO_ADDRESS, "position", `position ${positionId} does not exist`);
+  return { id: positionId, ...position };
+}
+
+async function requireLifetimeToken(token) {
+  gate(token !== normalizeAddress(ADDR.weth), "token", "WETH is not claimable stock credit");
+  const tokens = await distributedTokens();
+  gate(tokens.includes(token), "token", "token is not in StockLock's lifetime distributed-token list");
+  return tokens;
+}
+
+async function commandVerify() {
+  const result = await verifyDeployment();
+  out({ ok: result.ok, command, ...result }, result.ok ? 0 : 1);
+}
+
+async function commandStatus() {
+  const deployment = await deploymentGate();
+  out({ ok: true, command, deployment, status: await protocolStatus() });
+}
+
+async function commandInventory() {
+  const deployment = await deploymentGate();
+  const cursor = args.cursor === undefined ? 0n : integerArg("cursor");
+  const limit = args.limit === undefined ? 100n : integerArg("limit", { min: 1n, max: 100n });
+  out({ ok: true, command, deployment, inventory: await inventoryPage(cursor, limit) });
+}
+
+async function commandPunk() {
+  const deployment = await deploymentGate();
+  const wallet = walletArg();
+  const tokenId = integerArg("token-id", { min: 1n });
+  const [owner, approved, transferValidator] = await Promise.all([
+    readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [tokenId]),
+    readAddress(ADDR.punks, SIG.getApproved, ["uint256"], [tokenId]),
+    readAddress(ADDR.punks, SIG.getTransferValidator).catch(() => null),
+  ]);
+  out({ ok: true, command, deployment, wallet, tokenId, owner, ownedByWallet: owner === wallet, approved, transferValidator });
+}
+
+async function commandCrew() {
+  const deployment = await deploymentGate();
+  const wallet = walletArg();
+  out({ ok: true, command, deployment, wallet, positions: await walletCrew(wallet), tiers: TIERS });
+}
+
+async function commandRewards() {
+  const deployment = await deploymentGate();
+  const wallet = walletArg();
+  out({ ok: true, command, deployment, wallet, rewards: await walletRewards(wallet) });
+}
+
+async function planBuy() {
+  await deploymentGate();
+  await routeGate("fee");
+  const wallet = walletArg();
+  const inventoryCount = await readUint(ADDR.punkAMM, "inventoryCount()");
+  gate(inventoryCount > 0n, "inventory", "Punk Town desk inventory is empty");
+  const tokenId = await readUint(ADDR.punkAMM, "fifoHead()");
+  let headOwner;
+  try {
+    headOwner = await readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [tokenId]);
+  } catch {
+    throw new GateError("fifo-custody", `FIFO head #${tokenId} ownerOf reverted; use the proven broken-head repair flow instead of buy`);
+  }
+  gate(headOwner === normalizeAddress(ADDR.punkAMM), "fifo-custody", `PunkAMM no longer owns FIFO head #${tokenId}; do not submit buy`, { headOwner });
+  if (args["expected-token-id"] !== undefined) {
+    const expected = integerArg("expected-token-id", { min: 1n });
+    gate(tokenId === expected, "fifo-head", `FIFO head changed from #${expected} to #${tokenId}; do not buy a different Punk silently`, {
+      expected, actual: tokenId,
+    });
+  }
+  const quote = await feeQuote(wallet);
+  const codeBearingWallet = (await getCode(wallet)) !== "0x";
+  const terms = {
+    tokenId,
+    maxBaesIn: BUY_TOTAL,
+    slippageBps: quote.slippageBps,
+    recipient: wallet,
+    approval: { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.punkAMM), exactAmount: BUY_TOTAL },
+  };
+  const report = `Buy FIFO head Bario Punk #${tokenId} for exactly ${formatUnits(BUY_TOTAL, 18)} BAES max, using at most ${quote.slippageBps} bps WETH fee-conversion slippage and an exact PunkAMM BAES approval if needed?`;
+  const warnings = codeBearingWallet
+    ? ["The wallet has bytecode. The successful preflight is required evidence that the current ERC721-C validator/receiver path accepts this wallet."]
+    : [];
+  const approval = await erc20Approval(ADDR.baes, ADDR.punkAMM, BUY_TOTAL, wallet, "6,600,000 BAES for PunkAMM buy");
+  if (approval.tx) {
+    out(await approvalPlan({
+      action: "buy",
+      wallet,
+      approvals: [approval.tx],
+      after: `node scripts/punktown.mjs plan-buy --wallet ${wallet} --expected-token-id ${tokenId} --slippage-bps ${quote.slippageBps}`,
+      terms,
+      report,
+      warnings,
+      reads: {
+        fifoHead: tokenId, headOwner, baesBalance: approval.balance, currentAllowance: approval.allowance,
+        exactAllowance: BUY_TOTAL, quoteWethOut: quote.quote, minWethOut: quote.minWethOut,
+        quoteBlock: quote.quoteBlock, deadline: quote.deadline,
+      },
+    }));
+    return;
+  }
+  const tx = unsignedTx(
+    ADDR.punkAMM,
+    encodeCall(SIG.buy, ["uint256", "uint256", "uint256", "uint256"], [tokenId, BUY_TOTAL, quote.minWethOut, quote.deadline]),
+    `buy FIFO head Bario Punk #${tokenId}`,
+  );
+  out(await finalPlan({
+    action: "buy",
+    wallet,
+    tx,
+    terms,
+    report,
+    expectedEvents: ["NFTBought", "ConversionFeeSwapped", "RevenueDeposited"],
+    postconditions: [`BarioPunks.ownerOf(${tokenId}) == ${wallet}`, "NFTBought.baesIn == 6600000e18", "receipt.status == success"],
+    warnings,
+    reads: { fifoHead: tokenId, headOwner, inventoryCount, quoteWethOut: quote.quote, minWethOut: quote.minWethOut, quoteBlock: quote.quoteBlock, deadline: quote.deadline },
+  }));
+}
+
+async function planSell() {
+  await deploymentGate();
+  await routeGate("fee");
+  const wallet = walletArg();
+  const tokenId = integerArg("token-id", { min: 1n });
+  const sellCapacity = await readUint(ADDR.punkAMM, "sellCapacity()");
+  gate(sellCapacity > 0n, "reserve", "Punk Town desk does not currently have principal capacity for a sell");
+  const [deskTracked, vaultTracked] = await Promise.all([
+    readBool(ADDR.punkAMM, "trackedToken(uint256)", ["uint256"], [tokenId]),
+    readBool(ADDR.lockVault, "trackedNFT(uint256)", ["uint256"], [tokenId]),
+  ]);
+  gate(!deskTracked && !vaultTracked, "tracking", `Bario Punk #${tokenId} is already tracked by a protocol custody surface`, { deskTracked, vaultTracked });
+  const quote = await feeQuote(wallet);
+  const terms = {
+    tokenId,
+    exactBaesOut: SELL_PAYOUT,
+    slippageBps: quote.slippageBps,
+    recipient: wallet,
+    approval: { token: normalizeAddress(ADDR.punks), spender: normalizeAddress(ADDR.punkAMM), tokenId },
+  };
+  const report = `Sell Bario Punk #${tokenId} to Punk Town and receive exactly ${formatUnits(SELL_PAYOUT, 18)} BAES, using at most ${quote.slippageBps} bps WETH fee-conversion slippage and a token-specific PunkAMM approval if needed?`;
+  const warnings = ["The Bario Punks external ERC721-C validator is mutable outside Punk Town. The live simulation must succeed immediately before submission."];
+  const approval = await nftApproval(ADDR.punkAMM, tokenId, wallet, `Bario Punk #${tokenId} -> PunkAMM`);
+  if (approval.tx) {
+    out(await approvalPlan({
+      action: "sell",
+      wallet,
+      approvals: [approval.tx],
+      after: `node scripts/punktown.mjs plan-sell --wallet ${wallet} --token-id ${tokenId} --slippage-bps ${quote.slippageBps}`,
+      terms,
+      report,
+      warnings,
+      reads: {
+        owner: approval.owner, currentApproved: approval.approved, exactSpender: ADDR.punkAMM,
+        sellCapacity, quoteWethOut: quote.quote, minWethOut: quote.minWethOut,
+        quoteBlock: quote.quoteBlock, deadline: quote.deadline,
+      },
+    }));
+    return;
+  }
+  const tx = unsignedTx(
+    ADDR.punkAMM,
+    encodeCall(SIG.sell, ["uint256", "uint256", "uint256", "uint256"], [tokenId, SELL_PAYOUT, quote.minWethOut, quote.deadline]),
+    `sell Bario Punk #${tokenId} to Punk Town`,
+  );
+  out(await finalPlan({
+    action: "sell",
+    wallet,
+    tx,
+    terms,
+    report,
+    expectedEvents: ["NFTSold", "ConversionFeeSwapped", "RevenueDeposited"],
+    postconditions: [`BarioPunks.ownerOf(${tokenId}) == ${ADDR.punkAMM.toLowerCase()}`, "wallet BAES increase == 5400000e18", "receipt.status == success"],
+    warnings,
+    reads: { sellCapacity, quoteWethOut: quote.quote, minWethOut: quote.minWethOut, quoteBlock: quote.quoteBlock, deadline: quote.deadline },
+  }));
+}
+
+async function planStake() {
+  await deploymentGate();
+  await routeGate("stock");
+  const wallet = walletArg();
+  const tokenId = integerArg("token-id", { min: 1n });
+  const tierId = Number(integerArg("tier", { min: 0n, max: 4n }));
+  const tier = TIERS[tierId];
+  const beneficiary = args.beneficiary ? normalizeAddress(args.beneficiary) : wallet;
+  gate(beneficiary !== ZERO_ADDRESS, "beneficiary", "beneficiary cannot be zero");
+  const activeCount = await readUint(ADDR.lockVault, "activeCount()");
+  gate(activeCount < 3333n, "crew-cap", "Crew active-position cap is full");
+  const [deskTracked, vaultTracked] = await Promise.all([
+    readBool(ADDR.punkAMM, "trackedToken(uint256)", ["uint256"], [tokenId]),
+    readBool(ADDR.lockVault, "trackedNFT(uint256)", ["uint256"], [tokenId]),
+  ]);
+  gate(!deskTracked && !vaultTracked, "tracking", `Bario Punk #${tokenId} is already tracked by a protocol custody surface`, { deskTracked, vaultTracked });
+  const terms = {
+    tokenId,
+    tier: tierId,
+    tierName: tier.name,
+    baesCost: tier.cost,
+    weight: tier.weight,
+    beneficiary,
+    approvals: [
+      { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.lockVault), exactAmount: tier.cost },
+      { token: normalizeAddress(ADDR.punks), spender: normalizeAddress(ADDR.lockVault), tokenId },
+    ],
+  };
+  const report = `Add Bario Punk #${tokenId} to Crew at ${tier.name} tier for ${formatUnits(tier.cost, 18)} non-refundable BAES, beneficiary ${beneficiary}, using exact BAES and token-specific NFT approvals if needed?`;
+  const warnings = [
+    "Tier payment is never refunded on unstake; half burns and half enters the desk reserve.",
+    ...(beneficiary !== wallet ? ["Beneficiary differs from depositor permanently: this wallet manages/unstakes the Punk, while the beneficiary owns reward claims."] : []),
+  ];
+  const [baesApproval, punkApproval] = await Promise.all([
+    erc20Approval(ADDR.baes, ADDR.lockVault, tier.cost, wallet, `${formatUnits(tier.cost, 18)} BAES for ${tier.name} stake`),
+    nftApproval(ADDR.lockVault, tokenId, wallet, `Bario Punk #${tokenId} -> LockVault`),
+  ]);
+  const nextApproval = [baesApproval.tx, punkApproval.tx].find(Boolean);
+  if (nextApproval) {
+    out(await approvalPlan({
+      action: "stake",
+      wallet,
+      approvals: [nextApproval],
+      after: `node scripts/punktown.mjs plan-stake --wallet ${wallet} --token-id ${tokenId} --tier ${tierId} --beneficiary ${beneficiary}`,
+      terms,
+      report,
+      warnings,
+      reads: { activeCount, baesBalance: baesApproval.balance, baesAllowance: baesApproval.allowance, punkApproved: punkApproval.approved },
+    }));
+    return;
+  }
+  const tx = unsignedTx(
+    ADDR.lockVault,
+    encodeCall(SIG.stake, ["uint256", "uint8", "address"], [tokenId, tierId, beneficiary]),
+    `stake Bario Punk #${tokenId} in ${tier.name}`,
+  );
+  out(await finalPlan({
+    action: "stake",
+    wallet,
+    tx,
+    terms,
+    report,
+    expectedEvents: ["PositionOpened"],
+    postconditions: ["PositionOpened identifies the new positionId and tokenId", `BarioPunks.ownerOf(${tokenId}) == ${ADDR.lockVault.toLowerCase()}`, "receipt.status == success"],
+    warnings,
+    reads: { activeCount },
+  }));
+}
+
+async function planUpgrade() {
+  await deploymentGate();
+  await routeGate("stock");
+  const wallet = walletArg();
+  const positionId = integerArg("position-id", { min: 1n });
+  const newTierId = Number(integerArg("new-tier", { min: 0n, max: 4n }));
+  const position = await getPosition(positionId);
+  gate(position.active, "position", `position ${positionId} is not active`);
+  gate(position.depositor === wallet, "depositor", "only the recorded depositor can upgrade this position", { depositor: position.depositor });
+  gate(newTierId > position.tier, "tier", "Crew upgrades are upward-only");
+  const oldTier = TIERS[position.tier];
+  const newTier = TIERS[newTierId];
+  const delta = newTier.cost - oldTier.cost;
+  const terms = {
+    positionId,
+    fromTier: position.tier,
+    toTier: newTierId,
+    baesDelta: delta,
+    newWeight: newTier.weight,
+    approval: { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.lockVault), exactAmount: delta },
+  };
+  const report = `Upgrade Crew position ${positionId} from ${oldTier.name} to ${newTier.name} for ${formatUnits(delta, 18)} additional non-refundable BAES, using an exact LockVault approval if needed?`;
+  const warnings = ["The old weight settles first; the new weight never earns past conversions. Upgrade BAES is non-refundable."];
+  const approval = await erc20Approval(ADDR.baes, ADDR.lockVault, delta, wallet, `${formatUnits(delta, 18)} BAES upgrade delta`);
+  if (approval.tx) {
+    out(await approvalPlan({
+      action: "upgrade",
+      wallet,
+      approvals: [approval.tx],
+      after: `node scripts/punktown.mjs plan-upgrade --wallet ${wallet} --position-id ${positionId} --new-tier ${newTierId}`,
+      terms,
+      report,
+      warnings,
+      reads: { position, delta, baesBalance: approval.balance, currentAllowance: approval.allowance },
+    }));
+    return;
+  }
+  const tx = unsignedTx(ADDR.lockVault, encodeCall(SIG.upgrade, ["uint256", "uint8"], [positionId, newTierId]), `upgrade Crew position ${positionId} to ${newTier.name}`);
+  out(await finalPlan({
+    action: "upgrade",
+    wallet,
+    tx,
+    terms,
+    report,
+    expectedEvents: ["PositionUpgraded", "CreditWritten only when nonzero old-weight rewards settle"],
+    postconditions: [`positions(${positionId}).tier == ${newTierId}`, `positions(${positionId}).weight == ${newTier.weight}`, "receipt.status == success"],
+    warnings,
+    reads: { position },
+  }));
+}
+
+async function planUnstake() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const positionId = integerArg("position-id", { min: 1n });
+  const position = await getPosition(positionId);
+  gate(position.active, "position", `position ${positionId} is not active`);
+  gate(position.depositor === wallet, "depositor", "only the recorded depositor can unstake this position", { depositor: position.depositor });
+  const [vaultTracked, currentOwner] = await Promise.all([
+    readBool(ADDR.lockVault, "trackedNFT(uint256)", ["uint256"], [position.tokenId]),
+    readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [position.tokenId]),
+  ]);
+  gate(vaultTracked && currentOwner === normalizeAddress(ADDR.lockVault), "custody", "active position NFT custody does not match LockVault tracking", { vaultTracked, currentOwner });
+  const recipient = recipientArg(wallet);
+  gate(recipient !== ZERO_ADDRESS, "recipient", "unstake recipient cannot be zero");
+  const direct = recipient === wallet;
+  const tx = unsignedTx(
+    ADDR.lockVault,
+    direct
+      ? encodeCall(SIG.unstake, ["uint256"], [positionId])
+      : encodeCall(SIG.unstakeTo, ["uint256", "address"], [positionId, recipient]),
+    `unstake Crew position ${positionId} to ${recipient}`,
+  );
+  out(await finalPlan({
+    action: "unstake",
+    wallet,
+    tx,
+    terms: { positionId, tokenId: position.tokenId, recipient, beneficiary: position.beneficiary },
+    report: `Close Crew position ${positionId} and send Bario Punk #${position.tokenId} to ${recipient}?`,
+    expectedEvents: ["PositionClosed", "CreditWritten only when nonzero rewards settle"],
+    postconditions: [`positions(${positionId}).active == false`, `BarioPunks.ownerOf(${position.tokenId}) == ${recipient}`, "receipt.status == success"],
+    warnings: [
+      "Unstake returns only the NFT; tier BAES is not refunded. Accrued stock credit remains owned by the recorded beneficiary.",
+      "Route pauses do not block this exit, but the external Bario Punks ERC721-C validator can still block a transfer outside Punk Town's control.",
+    ],
+    reads: { position },
+  }));
+}
+
+async function pendingForPosition(positionId) {
+  const tokens = await distributedTokens();
+  const pending = [];
+  for (const token of tokens) {
+    const amount = await readUint(ADDR.stockLock, "pendingStock(uint256,address)", ["uint256", "address"], [positionId, token]);
+    if (amount > 0n) pending.push({ token, amount });
+  }
+  return pending;
+}
+
+async function planSettle() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const positionId = integerArg("position-id", { min: 1n });
+  const position = await getPosition(positionId);
+  const pending = await pendingForPosition(positionId);
+  gate(pending.length > 0, "pending", `position ${positionId} has no nonzero unsettled stock at current state`);
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.settle, ["uint256"], [positionId]), `settle Crew position ${positionId}`);
+  out(await finalPlan({
+    action: "settle",
+    wallet,
+    tx,
+    terms: { positionIds: [positionId], beneficiary: position.beneficiary, pendingByPosition: [{ positionId, pending }] },
+    report: `Settle Crew position ${positionId} to beneficiary credit ${position.beneficiary}: ${pending.map(({ token, amount }) => `${token}=${amount}`).join("; ")}?`,
+    expectedEvents: ["CreditWritten"],
+    postconditions: pending.map(({ token }) => `pendingStock(${positionId}, ${token}) == 0 after receipt`),
+    reads: { position, pending },
+  }));
+}
+
+async function planSettleAll() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const positions = (await allPositions()).filter((position) => position.beneficiary === wallet);
+  const settleable = [];
+  const pendingByPosition = [];
+  for (const position of positions) {
+    const pending = await pendingForPosition(position.id);
+    if (pending.length > 0) {
+      settleable.push(position.id);
+      pendingByPosition.push({ positionId: position.id, pending });
+    }
+    if (settleable.length === MAX_BATCH) break;
+  }
+  gate(settleable.length > 0, "pending", "no beneficiary-owned Crew position currently has unsettled stock");
+  const signature = settleable.length === 1 ? SIG.settle : SIG.settleBatch;
+  const types = settleable.length === 1 ? ["uint256"] : ["uint256[]"];
+  const values = settleable.length === 1 ? [settleable[0]] : [settleable];
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(signature, types, values), `settle ${settleable.length} beneficiary position(s)`);
+  out(await finalPlan({
+    action: "settle-all",
+    wallet,
+    tx,
+    terms: { positionIds: settleable, beneficiary: wallet, pendingByPosition },
+    report: `Settle the next ${settleable.length} position(s) with these current pending rewards for ${wallet}: ${pendingByPosition.map(({ positionId, pending }) => `position ${positionId} [${pending.map(({ token, amount }) => `${token}=${amount}`).join(", ")}]`).join("; ")}?`,
+    expectedEvents: ["CreditWritten"],
+    postconditions: ["All listed positions' current pending rewards become stockCredit for the wallet", "receipt.status == success"],
+    reads: { pendingByPosition, maxBatch: MAX_BATCH },
+  }));
+}
+
+async function claimState(token, wallet) {
+  await requireLifetimeToken(token);
+  const [credit, metadata] = await Promise.all([
+    readUint(ADDR.stockLock, "stockCredit(address,address)", ["address", "address"], [token, wallet]),
+    readTokenMeta(token),
+  ]);
+  gate(credit > 0n, "credit", `wallet has no claimable ${metadata.symbol} credit`);
+  return { credit, metadata };
+}
+
+async function planClaim() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const token = tokenArg();
+  const recipient = recipientArg(wallet);
+  const { credit, metadata } = await claimState(token, wallet);
+  const direct = recipient === wallet;
+  const tx = unsignedTx(
+    ADDR.stockLock,
+    direct ? encodeCall(SIG.claim, ["address"], [token]) : encodeCall(SIG.claimTo, ["address", "address"], [token, recipient]),
+    `claim ${metadata.symbol} credit to ${recipient}`,
+  );
+  out(await finalPlan({
+    action: "claim",
+    wallet,
+    tx,
+    terms: { token, symbol: metadata.symbol, amount: credit, recipient },
+    report: `Strict-claim ${metadata.decimals === null ? credit : formatUnits(credit, metadata.decimals)} ${metadata.symbol} to ${recipient}?`,
+    expectedEvents: ["Claimed"],
+    postconditions: [`stockCredit(${token}, ${wallet}) == 0`, "recipient receives the exact credited amount", "receipt.status == success"],
+    reads: { credit, metadata },
+  }));
+}
+
+async function planClaimBatch() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const tokens = tokenListArg();
+  const recipient = recipientArg(wallet);
+  const lifetime = await distributedTokens();
+  for (const token of tokens) {
+    gate(token !== normalizeAddress(ADDR.weth) && lifetime.includes(token), "token", `${token} is not a claimable lifetime stock token`);
+  }
+  const credits = [];
+  for (const token of tokens) {
+    const credit = await readUint(ADDR.stockLock, "stockCredit(address,address)", ["address", "address"], [token, wallet]);
+    const metadata = await readTokenMeta(token);
+    credits.push({ token, credit, metadata });
+  }
+  gate(credits.some(({ credit }) => credit > 0n), "credit", "none of the requested tokens has claimable credit");
+  const claims = credits.map(({ token, credit, metadata }) => ({ token, symbol: metadata.symbol, amount: credit }));
+  const claimLines = claims.map(({ token, symbol, amount }) => `${symbol} (${token}): ${amount}`).join("; ");
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.claimBatch, ["address[]", "address"], [tokens, recipient]), `strict batch claim ${tokens.length} stock token(s)`);
+  out(await finalPlan({
+    action: "claim-batch",
+    wallet,
+    tx,
+    terms: { claims, recipient },
+    report: `Strict batch-claim these exact current credits to ${recipient}: ${claimLines}?`,
+    expectedEvents: ["Claimed"],
+    postconditions: ["Every nonzero listed credit becomes zero", "Every transfer delivers exactly its credit", "receipt.status == success"],
+    warnings: ["Strict batch claim is atomic: if one token rejects or short-delivers, every token in the batch reverts. Use plan-claim-all for isolated per-token claims."],
+    reads: { credits },
+  }));
+}
+
+async function planClaimAll() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const recipient = recipientArg(wallet);
+  const tokens = await distributedTokens();
+  const claims = [];
+  for (const token of tokens) {
+    if (token === normalizeAddress(ADDR.weth)) continue;
+    const credit = await readUint(ADDR.stockLock, "stockCredit(address,address)", ["address", "address"], [token, wallet]);
+    if (credit === 0n) continue;
+    const metadata = await readTokenMeta(token);
+    claims.push({ token, credit, metadata });
+  }
+  gate(claims.length > 0, "credit", "wallet has no claimable stock credit across the lifetime token list");
+  const selected = claims[0];
+  const tx = unsignedTx(
+    ADDR.stockLock,
+    encodeCall(SIG.claimTo, ["address", "address"], [selected.token, recipient]),
+    `strict claim ${selected.metadata.symbol} to ${recipient}`,
+  );
+  const plan = await finalPlan({
+    action: "claim-all-step",
+    wallet,
+    tx,
+    terms: {
+      recipient,
+      selected: { token: selected.token, amount: selected.credit, symbol: selected.metadata.symbol },
+      remainingTokenCountIncludingThis: claims.length,
+    },
+    report: `Claim-all step 1/${claims.length}: strict-claim ${selected.metadata.decimals === null ? selected.credit : formatUnits(selected.credit, selected.metadata.decimals)} ${selected.metadata.symbol} to ${recipient}?`,
+    expectedEvents: ["Claimed"],
+    postconditions: [`stockCredit(${selected.token}, ${wallet}) == 0`, "recipient receives the exact credited amount", "receipt.status == success"],
+    warnings: ["Claim-all is deliberately one transaction per fresh plan. Stop on a failed/unknown receipt and never fall back to lossy claim automatically."],
+    reads: { allCurrentClaims: claims },
+  });
+  plan.next = `After a successful receipt and postcondition check, re-run plan-claim-all --wallet ${wallet} --recipient ${recipient}. It will choose the next nonzero lifetime token, or report that none remain.`;
+  out(plan);
+}
+
+async function planClaimLossy() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const token = tokenArg();
+  const recipient = recipientArg(wallet);
+  const { credit, metadata } = await claimState(token, wallet);
+  gate(metadata.decimals !== null && metadata.decimals <= 36, "token-metadata", "token decimals are unavailable or unsafe to parse");
+  const minReceived = amountArg("min-received", metadata.decimals);
+  gate(minReceived > 0n && minReceived <= credit, "min-received", "lossy minimum must be positive and cannot exceed the full credit");
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.claimLossy, ["address", "address", "uint256"], [token, recipient, minReceived]), `LOSSY claim ${metadata.symbol} to ${recipient}`);
+  out(await finalPlan({
+    action: "claim-lossy",
+    wallet,
+    tx,
+    terms: {
+      token,
+      symbol: metadata.symbol,
+      fullCreditDebited: credit,
+      executionDebitRule: "full-current-credit-at-execution",
+      minReceived,
+      recipient,
+    },
+    report: `LOSSY claim: irreversibly debit the full ${formatUnits(credit, metadata.decimals)} ${metadata.symbol} credit currently recorded while accepting as little as ${formatUnits(minReceived, metadata.decimals)} to ${recipient}? The contract debits the full credit at execution, which can increase if someone settles more rewards first.`,
+    expectedEvents: ["ClaimedLossy"],
+    postconditions: [`stockCredit(${token}, ${wallet}) == 0`, "delivered >= minReceived", "receipt.status == success"],
+    warnings: [
+      "DESTRUCTIVE DELIVERY CHOICE: the full credit is debited even if the token delivers less. Use only after a strict claim is proven stuck; never automate this fallback.",
+      "The contract has no max-debit argument. A permissionless settlement mined between inspection and execution can increase the amount debited; the receipt proof will flag any drift but cannot undo it.",
+    ],
+    reads: { credit, metadata },
+  }));
+}
+
+async function planForfeit() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const token = tokenArg();
+  const { credit, metadata } = await claimState(token, wallet);
+  gate(metadata.decimals !== null && metadata.decimals <= 36, "token-metadata", "token decimals are unavailable or unsafe to parse");
+  const amount = amountArg("amount", metadata.decimals);
+  gate(amount <= credit, "amount", "forfeit amount exceeds wallet credit");
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.forfeit, ["address", "uint256"], [token, amount]), `FORFEIT ${metadata.symbol} credit`);
+  out(await finalPlan({
+    action: "forfeit",
+    wallet,
+    tx,
+    terms: { token, symbol: metadata.symbol, amount },
+    report: `PERMANENTLY FORFEIT ${formatUnits(amount, metadata.decimals)} ${metadata.symbol} credit without receiving any tokens?`,
+    expectedEvents: ["CreditForfeited"],
+    postconditions: [`stockCredit decreases by exactly ${amount}`, "no token transfer occurs", "receipt.status == success"],
+    warnings: ["DESTRUCTIVE AND IRREVERSIBLE: this burns claim credit for zero payment. Never suggest or execute it as normal cleanup."],
+    reads: { credit, metadata },
+  }));
+}
+
+async function planConvert() {
+  await deploymentGate();
+  await routeGate("stock");
+  const wallet = walletArg();
+  const amountIn = amountArg("amount-weth", 18);
+  gate(amountIn >= MIN_CONVERT && amountIn <= MAX_CONVERT, "amount", `conversion must be between ${formatUnits(MIN_CONVERT, 18)} and ${formatUnits(MAX_CONVERT, 18)} WETH`);
+  const [wethPot, totalWeight, rotationCursor, lastConvertBlock, block, distributedCount, bootstrapLocked, bootstrapRemainingSeconds, lastBootstrapAccrual] = await Promise.all([
+    readUint(ADDR.stockLock, "wethPot()"),
+    readUint(ADDR.lockVault, "totalWeight()"),
+    readUint(ADDR.stockLock, "rotationCursor()"),
+    readUint(ADDR.stockLock, "lastConvertBlock()"),
+    latestBlock(),
+    readUint(ADDR.stockLock, "distributedTokenCount()"),
+    readUint(ADDR.stockLock, "bootstrapLocked()"),
+    readUint(ADDR.stockLock, "bootstrapRemainingSeconds()"),
+    readUint(ADDR.stockLock, "lastBootstrapAccrual()"),
+  ]);
+  gate(totalWeight > 0n, "weight", "no active Crew weight exists");
+  let releasableBootstrap = 0n;
+  if (bootstrapLocked > 0n && bootstrapRemainingSeconds > 0n && lastBootstrapAccrual > 0n && block.timestamp > lastBootstrapAccrual) {
+    const elapsed = block.timestamp - lastBootstrapAccrual > bootstrapRemainingSeconds
+      ? bootstrapRemainingSeconds
+      : block.timestamp - lastBootstrapAccrual;
+    releasableBootstrap = bootstrapLocked * elapsed / bootstrapRemainingSeconds;
+  }
+  const effectivePot = wethPot + releasableBootstrap;
+  gate(amountIn <= effectivePot, "pot", "requested conversion exceeds the pot available after current bootstrap accrual", { wethPot, releasableBootstrap, effectivePot, amountIn });
+  gate(lastConvertBlock !== block.number, "rate-limit", "a conversion already occurred in the latest block; retry on the next block");
+  const next = await call(ADDR.stockAdapter, "nextEnabledFrom(uint256)", ["uint256"], [rotationCursor]);
+  const slot = decodeUint(next, 0);
+  const token = decodeAddress(next, 1);
+  const alreadyDistributed = await readBool(ADDR.stockLock, "isDistributedToken(address)", ["address"], [token]);
+  gate(alreadyDistributed || distributedCount < 16n, "token-cap", "next roster token would be a seventeenth lifetime distributed token; conversion is currently blocked");
+  const bounty = amountIn / 100n;
+  const swapIn = amountIn - bounty;
+  let indicativeQuote = null;
+  try {
+    indicativeQuote = decodeUint(await call(ADDR.stockAdapter, "quoteWethToStock(address,uint256)", ["address", "uint256"], [token, swapIn], wallet));
+  } catch { /* conversion has no quote gate by design; simulation remains authoritative */ }
+  const metadata = await readTokenMeta(token);
+  const deadline = block.timestamp + 300n;
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.convert, ["uint256", "uint256"], [amountIn, deadline]), `permissionless convert ${formatUnits(amountIn, 18)} WETH into next roster stock ${metadata.symbol}`);
+  out(await finalPlan({
+    action: "convert",
+    wallet,
+    tx,
+    terms: {
+      amountIn,
+      currentObservedSlot: slot,
+      currentObservedToken: token,
+      currentObservedSymbol: metadata.symbol,
+      executionTokenRule: "next-enabled-roster-token-at-execution",
+      bounty,
+      noPriceFloor: true,
+    },
+    report: `Permissionlessly convert ${formatUnits(amountIn, 18)} WETH from the pot into the next enabled roster token at execution (currently ${metadata.symbol}); caller bounty ${formatUnits(bounty, 18)} WETH? The token can rotate if another conversion lands first.`,
+    expectedEvents: ["Converted"],
+    postconditions: ["Converted.token is the contract-selected enabled roster token at execution", `Converted.bountyPaid == ${bounty}`, "stock output is nonzero", "receipt.status == success"],
+    warnings: [
+      "Stock conversion intentionally has minOut=0 and no oracle/TWAP price floor. The skill does not add a same-transaction quote gate; exposure is bounded by 0.5 WETH max and one conversion per block.",
+      "The token observation is informational, not calldata-bound. A prior conversion can advance rotation before this transaction executes.",
+    ],
+    reads: { block: block.number, wethPot, releasableBootstrap, effectivePot, totalWeight, rotationCursor, slot, token, swapIn, indicativeQuote, deadline },
+  }));
+}
+
+function sourceIdArg() {
+  const value = args["source-id"] ?? "BANKR-PUNKTOWN";
+  let sourceId;
+  try {
+    sourceId = typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value)
+      ? value.toLowerCase()
+      : asciiBytes32(String(value));
+  } catch (error) {
+    throw new GateError("args", `--source-id is invalid: ${error.message}`);
+  }
+  gate(sourceId !== `0x${"0".repeat(64)}`, "args", "--source-id cannot be zero");
+  return sourceId;
+}
+
+async function planWethTopup() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const amount = amountArg("amount-weth", 18);
+  const sourceId = sourceIdArg();
+  const totalWeight = await readUint(ADDR.lockVault, "totalWeight()");
+  const terms = {
+    amount,
+    sourceId,
+    destinationAccounting: totalWeight === 0n ? "bootstrapLocked" : "wethPot",
+    executionDestinationRule: "bootstrapLocked-if-zero-weight-else-wethPot",
+    approval: { token: normalizeAddress(ADDR.weth), spender: normalizeAddress(ADDR.stockLock), exactAmount: amount },
+  };
+  const report = `Irreversibly top up StockLock with ${formatUnits(amount, 18)} WETH via depositTopUp (not a raw transfer), using an exact StockLock approval if needed? Current accounting destination: ${terms.destinationAccounting}; execution uses Crew weight at that time.`;
+  const warnings = [
+    "This is an irreversible donation. sourceId is only a label, not authentication.",
+    "The accounting destination is selected at execution: zero Crew weight routes to bootstrapLocked; positive weight routes to wethPot.",
+  ];
+  const approval = await erc20Approval(ADDR.weth, ADDR.stockLock, amount, wallet, `${formatUnits(amount, 18)} WETH StockLock top-up`);
+  if (approval.tx) {
+    out(await approvalPlan({
+      action: "weth-topup",
+      wallet,
+      approvals: [approval.tx],
+      after: `node scripts/punktown.mjs plan-weth-topup --wallet ${wallet} --amount-weth ${args["amount-weth"]} --source-id ${sourceId}`,
+      terms,
+      report,
+      warnings,
+      reads: { balance: approval.balance, currentAllowance: approval.allowance, exactAllowance: amount, totalWeight },
+    }));
+    return;
+  }
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.topUpWeth, ["uint256", "bytes32"], [amount, sourceId]), `deposit ${formatUnits(amount, 18)} WETH into StockLock accounting`);
+  out(await finalPlan({
+    action: "weth-topup",
+    wallet,
+    tx,
+    terms,
+    report,
+    expectedEvents: ["RevenueDeposited"],
+    postconditions: [`RevenueDeposited.amount == ${amount}`, "RevenueDeposited.bootstrap reports zero/positive Crew weight at execution", "receipt.status == success"],
+    warnings,
+    reads: { totalWeight },
+  }));
+}
+
+async function planReserveTopup() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const amount = amountArg("amount-baes", 18);
+  const terms = {
+    amount,
+    approval: { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.punkAMM), exactAmount: amount },
+  };
+  const report = `Irreversibly add ${formatUnits(amount, 18)} BAES to the tracked PunkAMM reserve, using an exact PunkAMM approval if needed?`;
+  const warnings = ["This is an irreversible reserve donation, not a deposit with withdrawal rights."];
+  const approval = await erc20Approval(ADDR.baes, ADDR.punkAMM, amount, wallet, `${formatUnits(amount, 18)} BAES reserve top-up`);
+  if (approval.tx) {
+    out(await approvalPlan({
+      action: "reserve-topup",
+      wallet,
+      approvals: [approval.tx],
+      after: `node scripts/punktown.mjs plan-reserve-topup --wallet ${wallet} --amount-baes ${args["amount-baes"]}`,
+      terms,
+      report,
+      warnings,
+      reads: { balance: approval.balance, currentAllowance: approval.allowance, exactAllowance: amount },
+    }));
+    return;
+  }
+  const tx = unsignedTx(ADDR.punkAMM, encodeCall(SIG.topUpReserve, ["uint256"], [amount]), `top up PunkAMM reserve by ${formatUnits(amount, 18)} BAES`);
+  out(await finalPlan({
+    action: "reserve-topup",
+    wallet,
+    tx,
+    terms,
+    report,
+    expectedEvents: ["ReserveToppedUp"],
+    postconditions: [`trackedBAES increases by ${amount}`, "receipt.status == success"],
+    warnings,
+  }));
+}
+
+async function planSyncDonation() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const [rawBalance, trackedBAES] = await Promise.all([
+    readUint(ADDR.baes, SIG.balanceOf, ["address"], [ADDR.punkAMM]),
+    readUint(ADDR.punkAMM, "trackedBAES()"),
+  ]);
+  gate(rawBalance >= trackedBAES, "accounting", "raw PunkAMM BAES balance is below trackedBAES");
+  const donation = rawBalance - trackedBAES;
+  gate(donation > 0n, "donation", "there is no unsynchronized BAES donation");
+  const tx = unsignedTx(ADDR.punkAMM, encodeCall(SIG.syncDonation), `sync ${formatUnits(donation, 18)} donated BAES into tracked reserve`);
+  out(await finalPlan({
+    action: "sync-donation",
+    wallet,
+    tx,
+    terms: { donation, executionRule: "all-unsynchronized-baes-at-execution" },
+    report: `Permissionlessly reconcile all unsynchronized BAES into the tracked PunkAMM reserve (currently ${formatUnits(donation, 18)} BAES)? The amount can increase if another donation arrives first.`,
+    expectedEvents: ["DonationSynced"],
+    postconditions: ["DonationSynced reports the full execution-time surplus (at least the freshly inspected amount)", "receipt.status == success"],
+    warnings: ["The no-argument function reconciles the full donation surplus at execution; the current observed amount is not calldata-bound."],
+    reads: { rawBalance, trackedBAES, donation },
+  }));
+}
+
+async function planEvictHead() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const inventoryCount = await readUint(ADDR.punkAMM, "inventoryCount()");
+  gate(inventoryCount > 0n, "inventory", "desk inventory is empty");
+  const tokenId = await readUint(ADDR.punkAMM, "fifoHead()");
+  let owner = null;
+  let ownerOfReverted = false;
+  try {
+    owner = await readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [tokenId]);
+  } catch {
+    ownerOfReverted = true;
+  }
+  gate(ownerOfReverted || owner !== normalizeAddress(ADDR.punkAMM), "head", "FIFO head is still held by PunkAMM and cannot be evicted", { tokenId, owner });
+  const tx = unsignedTx(ADDR.punkAMM, encodeCall(SIG.evictHead), `evict proven-unowned FIFO head Bario Punk #${tokenId}`);
+  out(await finalPlan({
+    action: "evict-head",
+    wallet,
+    tx,
+    terms: { tokenId, observedOwner: owner, ownerOfReverted, executionRule: "broken-fifo-head-at-execution" },
+    report: `Permissionlessly remove the broken FIFO head at execution (currently #${tokenId}, which PunkAMM provably does not own)?`,
+    expectedEvents: ["HeadEvicted"],
+    postconditions: ["HeadEvicted names the execution-time FIFO head that was still proven unowned", "receipt.status == success"],
+    warnings: [
+      "This is maintenance for a proven broken head, not a normal buy retry.",
+      "The function has no tokenId argument. If the FIFO changes before mining, the contract can only evict whichever execution-time head is still proven unowned.",
+    ],
+    reads: { inventoryCount, tokenId, owner, ownerOfReverted },
+  }));
+}
+
+async function planPokeBootstrap() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const [bootstrapLocked, remainingSeconds, totalWeight, lastAccrual, wethPot] = await Promise.all([
+    readUint(ADDR.stockLock, "bootstrapLocked()"),
+    readUint(ADDR.stockLock, "bootstrapRemainingSeconds()"),
+    readUint(ADDR.lockVault, "totalWeight()"),
+    readUint(ADDR.stockLock, "lastBootstrapAccrual()"),
+    readUint(ADDR.stockLock, "wethPot()"),
+  ]);
+  const canReleaseBootstrap = totalWeight > 0n && bootstrapLocked > 0n;
+  const canRelockStrandedPot = totalWeight === 0n && wethPot > 0n;
+  const canResetEmptyVaultAnchor = totalWeight === 0n && lastAccrual > 0n;
+  gate(canReleaseBootstrap || canRelockStrandedPot || canResetEmptyVaultAnchor, "bootstrap", "pokeBootstrap would be a no-op at the current state");
+  const mode = canRelockStrandedPot
+    ? "relock-empty-vault-pot"
+    : canResetEmptyVaultAnchor
+      ? "reset-empty-vault-anchor"
+      : "start-or-release-bootstrap";
+  const tx = unsignedTx(ADDR.stockLock, encodeCall(SIG.pokeBootstrap), "permissionlessly advance bootstrap release accounting");
+  out(await finalPlan({
+    action: "poke-bootstrap",
+    wallet,
+    tx,
+    terms: { bootstrapLocked, wethPot, remainingSeconds, totalWeight, lastAccrual, mode },
+    report: canRelockStrandedPot
+      ? `Reconcile the empty Crew vault by moving ${formatUnits(wethPot, 18)} stranded WETH pot back into bootstrap hold-back?`
+      : canResetEmptyVaultAnchor
+        ? "Reset the stale bootstrap accrual anchor now that Crew weight is zero?"
+        : `Start or advance bootstrap accounting for ${formatUnits(bootstrapLocked, 18)} locked WETH while Crew weight is active?`,
+    expectedEvents: ["BootstrapReleased (only if an amount accrues; first poke may only set the anchor)"],
+    postconditions: ["bootstrap accounting remains conserved", "receipt.status == success"],
+    warnings: ["If this is the first active poke it may only set an accrual anchor and emit no BootstrapReleased event."],
+    reads: { bootstrapLocked, wethPot, remainingSeconds, totalWeight, lastAccrual },
+  }));
+}
+
+function decodeRecognizedLog(log) {
+  const topic = log.topics?.[0]?.toLowerCase();
+  const event = EVENT_BY_TOPIC.get(topic);
+  if (!event) return null;
+  return {
+    name: event.name,
+    signature: event.signature,
+    emitter: log.address,
+    indexed: (log.topics ?? []).slice(1),
+    data: log.data,
+    logIndex: log.logIndex ? BigInt(log.logIndex) : null,
+  };
+}
+
+const ACTION_INPUTS = Object.freeze({
+  approve: ["address", "uint256"],
+  buy: ["uint256", "uint256", "uint256", "uint256"],
+  sell: ["uint256", "uint256", "uint256", "uint256"],
+  "reserve-topup": ["uint256"],
+  "sync-donation": [],
+  "evict-head": [],
+  stake: ["uint256", "uint8", "address"],
+  upgrade: ["uint256", "uint8"],
+  unstake: ["uint256"],
+  "unstake-to": ["uint256", "address"],
+  settle: ["uint256"],
+  "settle-batch": ["uint256[]"],
+  claim: ["address"],
+  "claim-to": ["address", "address"],
+  "claim-batch": ["address[]", "address"],
+  "claim-lossy": ["address", "address", "uint256"],
+  forfeit: ["address", "uint256"],
+  convert: ["uint256", "uint256"],
+  "weth-topup": ["uint256", "bytes32"],
+  "poke-bootstrap": [],
+});
+
+function decodeKnownAction(action, data) {
+  const inputTypes = ACTION_INPUTS[action.name];
+  gate(inputTypes !== undefined, "allowlist", "recognized selector has no argument schema");
+  try {
+    return decodeCallArguments(inputTypes, data);
+  } catch (error) {
+    throw new GateError("calldata", error.message);
+  }
+}
+
+function contextUint(value, label) {
+  gate(typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value), "plan-context", `${label} must be a canonical uint string`);
+  return BigInt(value);
+}
+
+function contextAddress(value, label) {
+  try {
+    return normalizeAddress(value);
+  } catch {
+    throw new GateError("plan-context", `${label} must be a canonical address`);
+  }
+}
+
+function contextNumber(value, label, min, max) {
+  gate(Number.isInteger(value) && value >= min && value <= max, "plan-context", `${label} must be an integer between ${min} and ${max}`);
+  return value;
+}
+
+function sameUint(actual, expected, label) {
+  gate(actual === expected, "plan-context", `${label} does not match the confirmed planner context`, { actual, expected });
+}
+
+function sameAddress(actual, expected, label) {
+  gate(normalizeAddress(actual) === normalizeAddress(expected), "plan-context", `${label} does not match the confirmed planner context`, { actual, expected });
+}
+
+async function requireExactErc20ActionApproval(token, spender, exactAmount, wallet, label) {
+  const allowance = await readUint(token, SIG.allowance, ["address", "address"], [wallet, spender]);
+  sameUint(allowance, exactAmount, `${label} allowance`);
+  return allowance;
+}
+
+async function requireExactNftActionApproval(spender, tokenId, label) {
+  const approved = await readAddress(ADDR.punks, SIG.getApproved, ["uint256"], [tokenId]);
+  sameAddress(approved, spender, `${label} token-specific approval`);
+  return approved;
+}
+
+async function validateApprovalContext(target, decodedArgs, wallet, context) {
+  const { action: intent, terms } = context;
+  const [spender, actualAmount] = decodedArgs;
+  let token;
+  let exactAmount;
+  let tokenId;
+  let expectedSpender;
+
+  if (intent === "buy") {
+    token = normalizeAddress(ADDR.baes);
+    expectedSpender = normalizeAddress(ADDR.punkAMM);
+    exactAmount = BUY_TOTAL;
+    sameUint(contextUint(terms.maxBaesIn, "buy maxBaesIn"), BUY_TOTAL, "buy maxBaesIn");
+  } else if (intent === "sell") {
+    token = normalizeAddress(ADDR.punks);
+    expectedSpender = normalizeAddress(ADDR.punkAMM);
+    tokenId = contextUint(terms.tokenId, "sell tokenId");
+  } else if (intent === "stake") {
+    const tier = contextNumber(terms.tier, "stake tier", 0, 4);
+    tokenId = contextUint(terms.tokenId, "stake tokenId");
+    expectedSpender = normalizeAddress(ADDR.lockVault);
+    if (target === normalizeAddress(ADDR.baes)) {
+      token = normalizeAddress(ADDR.baes);
+      exactAmount = TIERS[tier].cost;
+      sameUint(contextUint(terms.baesCost, "stake baesCost"), exactAmount, "stake baesCost");
+    } else {
+      token = normalizeAddress(ADDR.punks);
+    }
+  } else if (intent === "upgrade") {
+    const fromTier = contextNumber(terms.fromTier, "upgrade fromTier", 0, 4);
+    const toTier = contextNumber(terms.toTier, "upgrade toTier", 0, 4);
+    gate(toTier > fromTier, "plan-context", "upgrade context is not upward-only");
+    token = normalizeAddress(ADDR.baes);
+    expectedSpender = normalizeAddress(ADDR.lockVault);
+    exactAmount = TIERS[toTier].cost - TIERS[fromTier].cost;
+    sameUint(contextUint(terms.baesDelta, "upgrade baesDelta"), exactAmount, "upgrade baesDelta");
+  } else if (intent === "weth-topup") {
+    token = normalizeAddress(ADDR.weth);
+    expectedSpender = normalizeAddress(ADDR.stockLock);
+    exactAmount = contextUint(terms.amount, "WETH top-up amount");
+  } else if (intent === "reserve-topup") {
+    token = normalizeAddress(ADDR.baes);
+    expectedSpender = normalizeAddress(ADDR.punkAMM);
+    exactAmount = contextUint(terms.amount, "reserve top-up amount");
+  } else {
+    throw new GateError("plan-context", `approval is not valid for planner intent ${intent}`);
+  }
+
+  sameAddress(target, token, "approval token");
+  sameAddress(spender, expectedSpender, "approval spender");
+  if (token === normalizeAddress(ADDR.punks)) {
+    sameUint(actualAmount, tokenId, "ERC721 tokenId");
+    const [owner, approved] = await Promise.all([
+      readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [tokenId]),
+      readAddress(ADDR.punks, SIG.getApproved, ["uint256"], [tokenId]),
+    ]);
+    gate(owner === wallet, "ownership", "active wallet no longer owns the approval Punk", { owner, wallet, tokenId });
+    gate(approved !== expectedSpender, "stale-plan", "token is already approved; re-run the planner for the action transaction");
+    return { intent, tokenKind: "ERC721", token, spender, tokenId, owner, currentApproved: approved };
+  }
+
+  gate(exactAmount > 0n, "plan-context", "exact ERC20 approval amount must be nonzero");
+  const [balance, allowance] = await Promise.all([
+    readUint(token, SIG.balanceOf, ["address"], [wallet]),
+    readUint(token, SIG.allowance, ["address", "address"], [wallet, spender]),
+  ]);
+  gate(balance >= exactAmount, "balance", "wallet balance is below the context-bound exact approval amount", { balance, exactAmount });
+  if (actualAmount === 0n) {
+    gate(allowance > 0n && allowance !== exactAmount, "approval-amount", "zero approval is allowed only to reset a current mismatched nonzero allowance", { allowance, exactAmount });
+  } else {
+    sameUint(actualAmount, exactAmount, "ERC20 approval amount");
+    gate(allowance === 0n, "stale-plan", "exact approval is valid only from zero allowance; re-run the planner", { allowance });
+  }
+  return { intent, tokenKind: "ERC20", token, spender, exactAmount, submittedAmount: actualAmount, balance, currentAllowance: allowance };
+}
+
+const CONTEXT_ACTIONS = Object.freeze({
+  buy: ["buy"],
+  sell: ["sell"],
+  stake: ["stake"],
+  upgrade: ["upgrade"],
+  unstake: ["unstake", "unstake-to"],
+  settle: ["settle"],
+  "settle-all": ["settle", "settle-batch"],
+  claim: ["claim", "claim-to"],
+  "claim-batch": ["claim-batch"],
+  "claim-all-step": ["claim-to"],
+  "claim-lossy": ["claim-lossy"],
+  forfeit: ["forfeit"],
+  convert: ["convert"],
+  "weth-topup": ["weth-topup"],
+  "reserve-topup": ["reserve-topup"],
+  "sync-donation": ["sync-donation"],
+  "evict-head": ["evict-head"],
+  "poke-bootstrap": ["poke-bootstrap"],
+});
+
+async function validateActionContext(target, action, decodedArgs, wallet, context) {
+  const { action: intent, terms } = context;
+  const allowed = CONTEXT_ACTIONS[intent];
+  gate(allowed?.includes(action.name), "plan-context", `selector ${action.name} does not match planner intent ${intent}`);
+
+  if (intent === "buy" || intent === "sell") {
+    sameUint(decodedArgs[0], contextUint(terms.tokenId, `${intent} tokenId`), `${intent} tokenId`);
+    sameAddress(terms.recipient, wallet, `${intent} recipient`);
+    const slippageBps = contextUint(terms.slippageBps, `${intent} slippageBps`);
+    gate(slippageBps >= 1n && slippageBps <= 1000n, "plan-context", `${intent} slippageBps is outside 1..1000`);
+    sameUint(decodedArgs[1], intent === "buy" ? BUY_TOTAL : SELL_PAYOUT, `${intent} fixed BAES amount`);
+    if (intent === "buy") {
+      await requireExactErc20ActionApproval(ADDR.baes, ADDR.punkAMM, BUY_TOTAL, wallet, "buy");
+    } else {
+      await requireExactNftActionApproval(ADDR.punkAMM, decodedArgs[0], "sell");
+    }
+  } else if (intent === "stake") {
+    const tier = contextNumber(terms.tier, "stake tier", 0, 4);
+    sameUint(decodedArgs[0], contextUint(terms.tokenId, "stake tokenId"), "stake tokenId");
+    sameUint(decodedArgs[1], BigInt(tier), "stake tier");
+    sameAddress(decodedArgs[2], contextAddress(terms.beneficiary, "stake beneficiary"), "stake beneficiary");
+    sameUint(contextUint(terms.baesCost, "stake baesCost"), TIERS[tier].cost, "stake tier cost");
+    await Promise.all([
+      requireExactErc20ActionApproval(ADDR.baes, ADDR.lockVault, TIERS[tier].cost, wallet, "stake"),
+      requireExactNftActionApproval(ADDR.lockVault, decodedArgs[0], "stake"),
+    ]);
+  } else if (intent === "upgrade") {
+    const fromTier = contextNumber(terms.fromTier, "upgrade fromTier", 0, 4);
+    const toTier = contextNumber(terms.toTier, "upgrade toTier", 0, 4);
+    gate(toTier > fromTier, "plan-context", "upgrade context is not upward-only");
+    sameUint(decodedArgs[0], contextUint(terms.positionId, "upgrade positionId"), "upgrade positionId");
+    sameUint(decodedArgs[1], BigInt(toTier), "upgrade toTier");
+    sameUint(contextUint(terms.baesDelta, "upgrade baesDelta"), TIERS[toTier].cost - TIERS[fromTier].cost, "upgrade BAES delta");
+    const position = await getPosition(decodedArgs[0]);
+    gate(position.active && position.depositor === wallet && position.tier === fromTier, "stale-plan", "upgrade position state changed; re-run planner", { position });
+    await requireExactErc20ActionApproval(ADDR.baes, ADDR.lockVault, TIERS[toTier].cost - TIERS[fromTier].cost, wallet, "upgrade");
+  } else if (intent === "unstake") {
+    sameUint(decodedArgs[0], contextUint(terms.positionId, "unstake positionId"), "unstake positionId");
+    const recipient = action.name === "unstake" ? wallet : decodedArgs[1];
+    sameAddress(recipient, contextAddress(terms.recipient, "unstake recipient"), "unstake recipient");
+    const position = await getPosition(decodedArgs[0]);
+    sameUint(position.tokenId, contextUint(terms.tokenId, "unstake tokenId"), "unstake tokenId");
+    gate(position.active && position.depositor === wallet, "stale-plan", "unstake position state changed; re-run planner", { position });
+  } else if (intent === "settle" || intent === "settle-all") {
+    const ids = terms.positionIds;
+    gate(Array.isArray(ids) && ids.length > 0 && ids.length <= MAX_BATCH, "plan-context", "settle context positionIds must contain 1..20 entries");
+    const expected = ids.map((id, index) => contextUint(id, `settle positionIds[${index}]`));
+    const actual = action.name === "settle" ? [decodedArgs[0]] : decodedArgs[0];
+    gate(actual.length === expected.length && actual.every((id, index) => id === expected[index]), "plan-context", "settle position list does not match planner context", { actual, expected });
+    gate(Array.isArray(terms.pendingByPosition) && terms.pendingByPosition.length === expected.length, "plan-context", "settle context must include pending amounts for every position");
+    for (let index = 0; index < expected.length; index += 1) {
+      const entry = terms.pendingByPosition[index];
+      sameUint(contextUint(entry.positionId, `pendingByPosition[${index}].positionId`), expected[index], "settle pending positionId");
+      gate(Array.isArray(entry.pending) && entry.pending.length > 0, "plan-context", "settle context pending list must be nonempty");
+      const fresh = await pendingForPosition(expected[index]);
+      gate(fresh.length === entry.pending.length, "stale-plan", `pending token count changed for position ${expected[index]}`);
+      for (let pendingIndex = 0; pendingIndex < fresh.length; pendingIndex += 1) {
+        sameAddress(fresh[pendingIndex].token, contextAddress(entry.pending[pendingIndex].token, "settle pending token"), "settle pending token");
+        sameUint(fresh[pendingIndex].amount, contextUint(entry.pending[pendingIndex].amount, "settle pending amount"), "settle pending amount");
+      }
+    }
+  } else if (intent === "claim" || intent === "claim-all-step") {
+    const selected = intent === "claim" ? terms : terms.selected;
+    const token = contextAddress(selected.token, "claim token");
+    const amount = contextUint(selected.amount, "claim amount");
+    sameAddress(decodedArgs[0], token, "claim token");
+    const recipient = action.name === "claim" ? wallet : decodedArgs[1];
+    sameAddress(recipient, contextAddress(terms.recipient, "claim recipient"), "claim recipient");
+    const freshCredit = await readUint(ADDR.stockLock, "stockCredit(address,address)", ["address", "address"], [token, wallet]);
+    sameUint(freshCredit, amount, "current strict-claim credit");
+  } else if (intent === "claim-batch") {
+    gate(Array.isArray(terms.claims) && terms.claims.length > 0 && terms.claims.length <= MAX_BATCH, "plan-context", "claim batch context must include 1..20 claim amounts");
+    const expectedTokens = terms.claims.map((claim, index) => contextAddress(claim.token, `claims[${index}].token`));
+    gate(decodedArgs[0].length === expectedTokens.length && decodedArgs[0].every((token, index) => token === expectedTokens[index]), "plan-context", "claim batch tokens do not match planner context");
+    sameAddress(decodedArgs[1], contextAddress(terms.recipient, "claim batch recipient"), "claim batch recipient");
+    for (let index = 0; index < terms.claims.length; index += 1) {
+      const expectedAmount = contextUint(terms.claims[index].amount, `claims[${index}].amount`);
+      const freshCredit = await readUint(ADDR.stockLock, "stockCredit(address,address)", ["address", "address"], [expectedTokens[index], wallet]);
+      sameUint(freshCredit, expectedAmount, `current batch credit ${expectedTokens[index]}`);
+    }
+  } else if (intent === "claim-lossy") {
+    const token = contextAddress(terms.token, "lossy claim token");
+    sameAddress(decodedArgs[0], token, "lossy claim token");
+    sameAddress(decodedArgs[1], contextAddress(terms.recipient, "lossy claim recipient"), "lossy claim recipient");
+    sameUint(decodedArgs[2], contextUint(terms.minReceived, "lossy minReceived"), "lossy minReceived");
+    gate(terms.executionDebitRule === "full-current-credit-at-execution", "plan-context", "lossy claim execution debit rule is missing or altered");
+    const expectedCredit = contextUint(terms.fullCreditDebited, "lossy fullCreditDebited");
+    const freshCredit = await readUint(ADDR.stockLock, "stockCredit(address,address)", ["address", "address"], [token, wallet]);
+    sameUint(freshCredit, expectedCredit, "current lossy full credit");
+  } else if (intent === "forfeit") {
+    sameAddress(decodedArgs[0], contextAddress(terms.token, "forfeit token"), "forfeit token");
+    sameUint(decodedArgs[1], contextUint(terms.amount, "forfeit amount"), "forfeit amount");
+  } else if (intent === "convert") {
+    const amount = contextUint(terms.amountIn, "convert amountIn");
+    sameUint(decodedArgs[0], amount, "convert amountIn");
+    gate(terms.executionTokenRule === "next-enabled-roster-token-at-execution" && terms.noPriceFloor === true, "plan-context", "convert execution semantics are missing or altered");
+    const cursor = await readUint(ADDR.stockLock, "rotationCursor()");
+    const next = await call(ADDR.stockAdapter, "nextEnabledFrom(uint256)", ["uint256"], [cursor]);
+    sameUint(decodeUint(next, 0), contextUint(terms.currentObservedSlot, "convert observed slot"), "currently observed convert slot");
+    sameAddress(decodeAddress(next, 1), contextAddress(terms.currentObservedToken, "convert observed token"), "currently observed convert token");
+  } else if (intent === "weth-topup") {
+    sameUint(decodedArgs[0], contextUint(terms.amount, "WETH top-up amount"), "WETH top-up amount");
+    gate(typeof terms.sourceId === "string" && /^0x[0-9a-f]{64}$/.test(terms.sourceId), "plan-context", "WETH top-up sourceId is invalid");
+    gate(decodedArgs[1].toLowerCase() === terms.sourceId, "plan-context", "WETH top-up sourceId does not match planner context");
+    gate(terms.executionDestinationRule === "bootstrapLocked-if-zero-weight-else-wethPot", "plan-context", "WETH top-up execution destination rule is missing or altered");
+    const totalWeight = await readUint(ADDR.lockVault, "totalWeight()");
+    const destination = totalWeight === 0n ? "bootstrapLocked" : "wethPot";
+    gate(terms.destinationAccounting === destination, "stale-plan", "WETH top-up accounting destination changed; re-run planner", { expected: terms.destinationAccounting, current: destination });
+    await requireExactErc20ActionApproval(ADDR.weth, ADDR.stockLock, decodedArgs[0], wallet, "WETH top-up");
+  } else if (intent === "reserve-topup") {
+    sameUint(decodedArgs[0], contextUint(terms.amount, "reserve top-up amount"), "reserve top-up amount");
+    await requireExactErc20ActionApproval(ADDR.baes, ADDR.punkAMM, decodedArgs[0], wallet, "reserve top-up");
+  } else if (intent === "sync-donation") {
+    gate(terms.executionRule === "all-unsynchronized-baes-at-execution", "plan-context", "sync donation execution rule is missing or altered");
+    const [raw, tracked] = await Promise.all([
+      readUint(ADDR.baes, SIG.balanceOf, ["address"], [ADDR.punkAMM]),
+      readUint(ADDR.punkAMM, "trackedBAES()"),
+    ]);
+    sameUint(raw - tracked, contextUint(terms.donation, "sync donation"), "current unsynchronized donation");
+  } else if (intent === "evict-head") {
+    gate(terms.executionRule === "broken-fifo-head-at-execution", "plan-context", "evict-head execution rule is missing or altered");
+    const freshHead = await readUint(ADDR.punkAMM, "fifoHead()");
+    sameUint(freshHead, contextUint(terms.tokenId, "evict tokenId"), "current FIFO head");
+  } else if (intent === "poke-bootstrap") {
+    const [locked, pot, weight, anchor] = await Promise.all([
+      readUint(ADDR.stockLock, "bootstrapLocked()"),
+      readUint(ADDR.stockLock, "wethPot()"),
+      readUint(ADDR.lockVault, "totalWeight()"),
+      readUint(ADDR.stockLock, "lastBootstrapAccrual()"),
+    ]);
+    sameUint(locked, contextUint(terms.bootstrapLocked, "poke bootstrapLocked"), "current bootstrapLocked");
+    sameUint(pot, contextUint(terms.wethPot, "poke wethPot"), "current wethPot");
+    sameUint(weight, contextUint(terms.totalWeight, "poke totalWeight"), "current totalWeight");
+    sameUint(anchor, contextUint(terms.lastAccrual, "poke lastAccrual"), "current lastBootstrapAccrual");
+    const currentMode = weight === 0n && pot > 0n
+      ? "relock-empty-vault-pot"
+      : weight === 0n && anchor > 0n
+        ? "reset-empty-vault-anchor"
+        : weight > 0n && locked > 0n
+          ? "start-or-release-bootstrap"
+          : null;
+    gate(currentMode && terms.mode === currentMode, "stale-plan", "pokeBootstrap usefulness/mode changed; re-run planner", { expected: terms.mode, current: currentMode });
+  }
+  return { intent };
+}
+
+async function validateKnownAction(target, action, decodedArgs, wallet = null, context = null) {
+  let approval = null;
+  let freshFeeQuote = null;
+  gate(context, "plan-context", "planner context is required for every write inspection");
+  const nonzeroAddress = (value, label) => gate(value !== ZERO_ADDRESS, "calldata", `${label} cannot be zero`);
+  const requireFutureDeadline = async (deadline, maxAhead) => {
+    const block = await latestBlock();
+    gate(deadline > block.timestamp && deadline <= block.timestamp + BigInt(maxAhead), "deadline", "deadline is expired or farther ahead than the planner permits", {
+      chainTimestamp: block.timestamp,
+      deadline,
+      maxAhead,
+    });
+  };
+
+  if (action.name === "approve") {
+    const [spender, amountOrTokenId] = decodedArgs;
+    const allowedSpenders = target === normalizeAddress(ADDR.baes)
+      ? [normalizeAddress(ADDR.punkAMM), normalizeAddress(ADDR.lockVault)]
+      : target === normalizeAddress(ADDR.weth)
+        ? [normalizeAddress(ADDR.stockLock)]
+        : [normalizeAddress(ADDR.punkAMM), normalizeAddress(ADDR.lockVault)];
+    gate(allowedSpenders.includes(spender), "approval-spender", "approval spender is outside the target token's allowlist", { spender });
+    approval = await validateApprovalContext(target, decodedArgs, wallet, context);
+  } else if (action.name === "buy") {
+    gate(decodedArgs[0] > 0n, "calldata", "buy expectedHeadTokenId must be nonzero");
+    gate(decodedArgs[1] === BUY_TOTAL, "calldata", "buy maxBAESIn must equal live BUY_TOTAL");
+    gate(decodedArgs[2] > 0n, "calldata", "buy minWethOut must be nonzero");
+    await requireFutureDeadline(decodedArgs[3], 600);
+    freshFeeQuote = decodeUint(await call(ADDR.feeRouter, "quoteExactBAESForWETH(uint256)", ["uint256"], [FEE], wallet));
+    const slippageBps = contextUint(context.terms.slippageBps, "buy slippageBps");
+    const floor = freshFeeQuote * (10_000n - slippageBps) / 10_000n;
+    gate(decodedArgs[2] >= floor, "slippage", "buy minWethOut is looser than the confirmed slippage tolerance", {
+      minWethOut: decodedArgs[2], freshFeeQuote,
+    });
+    const freshHead = await readUint(ADDR.punkAMM, "fifoHead()");
+    gate(decodedArgs[0] === freshHead, "fifo-head", "buy calldata no longer names the fresh FIFO head", { encoded: decodedArgs[0], freshHead });
+    const owner = await readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [freshHead]);
+    gate(owner === normalizeAddress(ADDR.punkAMM), "fifo-custody", "PunkAMM no longer owns the encoded FIFO head", { owner });
+  } else if (action.name === "sell") {
+    gate(decodedArgs[0] > 0n, "calldata", "sell tokenId must be nonzero");
+    gate(decodedArgs[1] === SELL_PAYOUT, "calldata", "sell minBAESOut must equal live SELL_PAYOUT");
+    gate(decodedArgs[2] > 0n, "calldata", "sell minWethOut must be nonzero");
+    await requireFutureDeadline(decodedArgs[3], 600);
+    freshFeeQuote = decodeUint(await call(ADDR.feeRouter, "quoteExactBAESForWETH(uint256)", ["uint256"], [FEE], wallet));
+    const slippageBps = contextUint(context.terms.slippageBps, "sell slippageBps");
+    const floor = freshFeeQuote * (10_000n - slippageBps) / 10_000n;
+    gate(decodedArgs[2] >= floor, "slippage", "sell minWethOut is looser than the confirmed slippage tolerance", {
+      minWethOut: decodedArgs[2], freshFeeQuote,
+    });
+    if (wallet) gate(await readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [decodedArgs[0]]) === wallet, "ownership", "active wallet no longer owns the sell token");
+  } else if (action.name === "stake") {
+    gate(decodedArgs[0] > 0n && decodedArgs[1] <= 4n, "calldata", "stake tokenId/tier is invalid");
+    nonzeroAddress(decodedArgs[2], "beneficiary");
+    if (wallet) gate(await readAddress(ADDR.punks, SIG.ownerOf, ["uint256"], [decodedArgs[0]]) === wallet, "ownership", "active wallet no longer owns the stake token");
+  } else if (action.name === "upgrade") {
+    gate(decodedArgs[0] > 0n && decodedArgs[1] <= 4n, "calldata", "upgrade position/tier is invalid");
+  } else if (action.name === "unstake") {
+    gate(decodedArgs[0] > 0n, "calldata", "unstake positionId must be nonzero");
+  } else if (action.name === "unstake-to") {
+    gate(decodedArgs[0] > 0n, "calldata", "unstake positionId must be nonzero");
+    nonzeroAddress(decodedArgs[1], "unstake recipient");
+  } else if (action.name === "settle") {
+    gate(decodedArgs[0] > 0n, "calldata", "settle positionId must be nonzero");
+  } else if (action.name === "settle-batch") {
+    gate(decodedArgs[0].length > 0 && decodedArgs[0].length <= MAX_BATCH, "calldata", "settle batch must contain 1..20 positions");
+    gate(decodedArgs[0].every((id) => id > 0n), "calldata", "settle batch position IDs must be nonzero");
+  } else if (action.name === "claim") {
+    nonzeroAddress(decodedArgs[0], "claim token");
+  } else if (action.name === "claim-to") {
+    nonzeroAddress(decodedArgs[0], "claim token");
+    nonzeroAddress(decodedArgs[1], "claim recipient");
+  } else if (action.name === "claim-batch") {
+    gate(decodedArgs[0].length > 0 && decodedArgs[0].length <= MAX_BATCH, "calldata", "claim batch must contain 1..20 tokens");
+    decodedArgs[0].forEach((token) => nonzeroAddress(token, "claim token"));
+    gate(new Set(decodedArgs[0]).size === decodedArgs[0].length, "calldata", "claim batch token list contains duplicates");
+    nonzeroAddress(decodedArgs[1], "claim recipient");
+  } else if (action.name === "claim-lossy") {
+    nonzeroAddress(decodedArgs[0], "claim token");
+    nonzeroAddress(decodedArgs[1], "claim recipient");
+    gate(decodedArgs[2] > 0n, "calldata", "lossy minReceived must be nonzero");
+  } else if (action.name === "forfeit") {
+    nonzeroAddress(decodedArgs[0], "forfeit token");
+    gate(decodedArgs[1] > 0n, "calldata", "forfeit amount must be nonzero");
+  } else if (action.name === "convert") {
+    gate(decodedArgs[0] >= MIN_CONVERT && decodedArgs[0] <= MAX_CONVERT, "calldata", "convert amount is outside protocol bounds");
+    await requireFutureDeadline(decodedArgs[1], 600);
+  } else if (action.name === "weth-topup") {
+    gate(decodedArgs[0] > 0n, "calldata", "WETH top-up amount must be nonzero");
+    gate(decodedArgs[1] !== `0x${"0".repeat(64)}`, "calldata", "WETH top-up sourceId must be nonzero");
+  } else if (action.name === "reserve-topup") {
+    gate(decodedArgs[0] > 0n, "calldata", "reserve top-up amount must be nonzero");
+  }
+
+  if (["claim", "claim-to", "claim-lossy", "forfeit"].includes(action.name)) {
+    await requireLifetimeToken(decodedArgs[0]);
+  } else if (action.name === "claim-batch") {
+    const lifetime = await distributedTokens();
+    gate(decodedArgs[0].every((token) => token !== normalizeAddress(ADDR.weth) && lifetime.includes(token)), "token", "claim batch contains a token outside StockLock's lifetime list");
+  }
+  const contextValidation = action.name === "approve"
+    ? { intent: context.action }
+    : await validateActionContext(target, action, decodedArgs, wallet, context);
+  return { approval, freshFeeQuote, context: contextValidation };
+}
+
+function expectedEmitter(action, target) {
+  if (action.name === "approve") return target;
+  if (["buy", "sell", "reserve-topup", "sync-donation", "evict-head"].includes(action.name)) return normalizeAddress(ADDR.punkAMM);
+  if (["stake", "upgrade", "unstake", "unstake-to"].includes(action.name)) return normalizeAddress(ADDR.lockVault);
+  return normalizeAddress(ADDR.stockLock);
+}
+
+function tradeSourceId(label, tokenId) {
+  const labelBytes = new TextEncoder().encode(label);
+  const tokenWord = BigInt(tokenId).toString(16).padStart(64, "0");
+  const tokenBytes = Uint8Array.from(tokenWord.match(/.{2}/g).map((byte) => Number.parseInt(byte, 16)));
+  const packed = new Uint8Array(labelBytes.length + tokenBytes.length);
+  packed.set(labelBytes);
+  packed.set(tokenBytes, labelBytes.length);
+  return keccak256(packed).toLowerCase();
+}
+
+async function durableReceiptProof(action, target, decodedArgs, from, receipt, recognizedEvents, context) {
+  const checks = [];
+  const add = (name, pass, actual = null, expected = null) => checks.push({ name, pass: Boolean(pass), actual, expected });
+  const topicAddress = (event, index) => decodeAddress(event.indexed[index]);
+  const topicUint = (event, index) => decodeUint(event.indexed[index]);
+  const emitter = expectedEmitter(action, target);
+  const events = (name, address = emitter) => recognizedEvents.filter((event) =>
+    event.name === name && normalizeAddress(event.emitter) === normalizeAddress(address));
+  const transfers = events("Transfer", ADDR.punks);
+  const hasPunkTransfer = (source, destination, tokenId) => transfers.some((event) =>
+    event.indexed.length === 3
+    && topicAddress(event, 0) === normalizeAddress(source)
+    && topicAddress(event, 1) === normalizeAddress(destination)
+    && topicUint(event, 2) === tokenId);
+
+  if (action.name === "approve") {
+    const [spender, amountOrTokenId] = decodedArgs;
+    const approvals = events("Approval", target);
+    const exact = target === normalizeAddress(ADDR.punks)
+      ? approvals.some((event) => event.indexed.length === 3
+        && topicAddress(event, 0) === from
+        && topicAddress(event, 1) === spender
+        && topicUint(event, 2) === amountOrTokenId)
+      : approvals.some((event) => event.indexed.length === 2
+        && topicAddress(event, 0) === from
+        && topicAddress(event, 1) === spender
+        && decodeUint(event.data, 0) === amountOrTokenId);
+    add("Approval exact receipt event", exact);
+  } else if (action.name === "buy") {
+    const exact = events("NFTBought").find((event) => topicAddress(event, 0) === from
+      && topicUint(event, 1) === decodedArgs[0]
+      && decodeUint(event.data, 0) === BUY_TOTAL
+      && decodeUint(event.data, 1) >= decodedArgs[2]);
+    add("NFTBought exact receipt event", Boolean(exact));
+    add("Bario Punk transfer desk to buyer", hasPunkTransfer(ADDR.punkAMM, from, decodedArgs[0]));
+    const expectedSource = tradeSourceId("NFT_BUY", decodedArgs[0]);
+    const fee = exact ? events("ConversionFeeSwapped", ADDR.revenueRouter).find((event) =>
+      event.indexed.length === 2
+      && event.indexed[0]?.toLowerCase() === expectedSource
+      && topicAddress(event, 1) === normalizeAddress(ADDR.punkAMM)
+      && decodeUint(event.data, 0) === FEE
+      && decodeUint(event.data, 1) === decodeUint(exact.data, 1)
+      && decodeBytes32(event.data, 2) === DEPLOYMENT.feeRoute.routeHash.toLowerCase()) : null;
+    add("ConversionFeeSwapped exact buy fee/source/route", Boolean(fee));
+    const revenue = fee ? events("RevenueDeposited", ADDR.stockLock).find((event) =>
+      event.indexed[0]?.toLowerCase() === fee.indexed[0]?.toLowerCase()
+      && decodeUint(event.data, 0) === decodeUint(fee.data, 1)
+      && [0n, 1n].includes(decodeUint(event.data, 1))) : null;
+    add("RevenueDeposited matches buy fee output/source", Boolean(revenue));
+  } else if (action.name === "sell") {
+    const exact = events("NFTSold").find((event) => topicAddress(event, 0) === from
+      && topicUint(event, 1) === decodedArgs[0]
+      && decodeUint(event.data, 0) === SELL_PAYOUT
+      && decodeUint(event.data, 1) >= decodedArgs[2]);
+    add("NFTSold exact receipt event", Boolean(exact));
+    add("Bario Punk transfer seller to desk", hasPunkTransfer(from, ADDR.punkAMM, decodedArgs[0]));
+    const expectedSource = tradeSourceId("NFT_SELL", decodedArgs[0]);
+    const fee = exact ? events("ConversionFeeSwapped", ADDR.revenueRouter).find((event) =>
+      event.indexed.length === 2
+      && event.indexed[0]?.toLowerCase() === expectedSource
+      && topicAddress(event, 1) === normalizeAddress(ADDR.punkAMM)
+      && decodeUint(event.data, 0) === FEE
+      && decodeUint(event.data, 1) === decodeUint(exact.data, 1)
+      && decodeBytes32(event.data, 2) === DEPLOYMENT.feeRoute.routeHash.toLowerCase()) : null;
+    add("ConversionFeeSwapped exact sell fee/source/route", Boolean(fee));
+    const revenue = fee ? events("RevenueDeposited", ADDR.stockLock).find((event) =>
+      event.indexed[0]?.toLowerCase() === fee.indexed[0]?.toLowerCase()
+      && decodeUint(event.data, 0) === decodeUint(fee.data, 1)
+      && [0n, 1n].includes(decodeUint(event.data, 1))) : null;
+    add("RevenueDeposited matches sell fee output/source", Boolean(revenue));
+  } else if (action.name === "reserve-topup") {
+    add("ReserveToppedUp exact receipt event", events("ReserveToppedUp").some((event) =>
+      topicAddress(event, 0) === from && decodeUint(event.data, 0) === decodedArgs[0]));
+  } else if (action.name === "sync-donation") {
+    const observed = contextUint(context.terms.donation, "sync donation");
+    const matched = events("DonationSynced").find((event) => event.indexed.length === 0 && decodeUint(event.data, 0) >= observed);
+    add("DonationSynced receipt event", Boolean(matched), matched ? decodeUint(matched.data, 0) : null, `>= ${observed}`);
+  } else if (action.name === "evict-head") {
+    const matched = events("HeadEvicted").find((event) => event.indexed.length === 1);
+    add("HeadEvicted receipt event", Boolean(matched), matched ? topicUint(matched, 0) : null, "broken FIFO head at execution");
+  } else if (action.name === "stake") {
+    const tier = Number(decodedArgs[1]);
+    const exact = events("PositionOpened").find((event) => topicUint(event, 1) === decodedArgs[0]
+      && topicAddress(event, 2) === decodedArgs[2]
+      && decodeUint(event.data, 0) === decodedArgs[1]
+      && decodeUint(event.data, 1) === BigInt(TIERS[tier].weight));
+    add("PositionOpened exact receipt event", Boolean(exact));
+    add("Bario Punk transfer depositor to LockVault", hasPunkTransfer(from, ADDR.lockVault, decodedArgs[0]));
+  } else if (action.name === "upgrade") {
+    add("PositionUpgraded exact receipt event", events("PositionUpgraded").some((event) =>
+      topicUint(event, 0) === decodedArgs[0]
+      && decodeUint(event.data, 0) === decodedArgs[1]
+      && decodeUint(event.data, 1) === BigInt(TIERS[Number(decodedArgs[1])].weight)));
+  } else if (action.name === "unstake" || action.name === "unstake-to") {
+    const recipient = action.name === "unstake" ? from : decodedArgs[1];
+    const tokenId = contextUint(context.terms.tokenId, "unstake tokenId");
+    add("PositionClosed exact receipt event", events("PositionClosed").some((event) => topicUint(event, 0) === decodedArgs[0]));
+    add("Bario Punk transfer LockVault to recipient", hasPunkTransfer(ADDR.lockVault, recipient, tokenId));
+  } else if (action.name === "settle" || action.name === "settle-batch") {
+    const creditEvents = events("CreditWritten");
+    const beneficiary = contextAddress(context.terms.beneficiary, "settle receipt beneficiary");
+    for (const entry of context.terms.pendingByPosition) {
+      const positionId = contextUint(entry.positionId, "settle receipt positionId");
+      for (const pending of entry.pending) {
+        const token = contextAddress(pending.token, "settle receipt token");
+        const amount = contextUint(pending.amount, "settle receipt amount");
+        add(`CreditWritten position ${positionId} token ${token}`, creditEvents.some((event) =>
+          topicUint(event, 0) === positionId
+          && topicAddress(event, 1) === token
+          && topicAddress(event, 2) === beneficiary
+          && decodeUint(event.data, 0) >= amount));
+      }
+    }
+  } else if (action.name === "claim" || action.name === "claim-to") {
+    const recipient = action.name === "claim" ? from : decodedArgs[1];
+    const selected = context.action === "claim" ? context.terms : context.terms.selected;
+    const expectedAmount = contextUint(selected.amount, "strict claim receipt amount");
+    const matched = events("Claimed").find((event) => topicAddress(event, 0) === from
+      && topicAddress(event, 1) === decodedArgs[0]
+      && topicAddress(event, 2) === recipient
+      && decodeUint(event.data, 0) >= expectedAmount);
+    add("Claimed exact actors/token and at least confirmed credit", Boolean(matched), matched ? decodeUint(matched.data, 0) : null, `>= ${expectedAmount}`);
+  } else if (action.name === "claim-batch") {
+    const claimEvents = events("Claimed");
+    for (const claim of context.terms.claims) {
+      const token = contextAddress(claim.token, "batch receipt token");
+      const expectedAmount = contextUint(claim.amount, "batch receipt amount");
+      if (expectedAmount === 0n) continue;
+      const matched = claimEvents.find((event) => topicAddress(event, 0) === from
+        && topicAddress(event, 1) === token
+        && topicAddress(event, 2) === decodedArgs[1]
+        && decodeUint(event.data, 0) >= expectedAmount);
+      add(`Claimed batch token ${token}`, Boolean(matched), matched ? decodeUint(matched.data, 0) : null, `>= ${expectedAmount}`);
+    }
+  } else if (action.name === "claim-lossy") {
+    const expectedDebit = contextUint(context.terms.fullCreditDebited, "lossy receipt debit");
+    const matched = events("ClaimedLossy").find((event) => topicAddress(event, 0) === from
+      && topicAddress(event, 1) === decodedArgs[0]
+      && topicAddress(event, 2) === decodedArgs[1]
+      && decodeUint(event.data, 0) === expectedDebit
+      && decodeUint(event.data, 1) >= decodedArgs[2]);
+    add("ClaimedLossy exact confirmed debit and minimum", Boolean(matched));
+  } else if (action.name === "forfeit") {
+    add("CreditForfeited exact receipt event", events("CreditForfeited").some((event) =>
+      topicAddress(event, 0) === from
+      && topicAddress(event, 1) === decodedArgs[0]
+      && decodeUint(event.data, 0) === decodedArgs[1]));
+  } else if (action.name === "convert") {
+    const bounty = decodedArgs[0] / 100n;
+    const matched = events("Converted").find((event) => topicAddress(event, 1) === from
+      && decodeUint(event.data, 0) === decodedArgs[0] - bounty
+      && decodeUint(event.data, 1) > 0n
+      && decodeUint(event.data, 2) === bounty);
+    add("Converted exact keeper/amounts receipt event", Boolean(matched), matched ? topicAddress(matched, 0) : null, "automatic enabled token at execution");
+  } else if (action.name === "weth-topup") {
+    const matched = events("RevenueDeposited").find((event) =>
+      event.indexed[0]?.toLowerCase() === decodedArgs[1].toLowerCase()
+      && decodeUint(event.data, 0) === decodedArgs[0]
+      && [0n, 1n].includes(decodeUint(event.data, 1)));
+    add("RevenueDeposited exact source/amount receipt event", Boolean(matched), matched ? decodeUint(matched.data, 1) === 1n : null, "bootstrap flag reports execution-time Crew state");
+  } else if (action.name === "poke-bootstrap") {
+    const releases = events("BootstrapReleased");
+    add("successful poke receipt; BootstrapReleased is optional", true, releases.length, ">=0");
+  } else {
+    add("recognized operation has a durable receipt proof", false, action.name, "implemented proof branch");
+  }
+
+  add("receipt block is fixed", Boolean(receipt.blockHash && receipt.blockNumber), receipt.blockNumber, "mined receipt");
+  return checks;
+}
+
+async function inspectTx() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const hash = need("tx");
+  const parsedContext = decodeInspectionContext(need("context"));
+  const suppliedInspectionKey = need("plan-key").toLowerCase();
+  gate(/^0x[0-9a-f]{64}$/.test(suppliedInspectionKey), "args", "--plan-key must be the 32-byte inspectionKey from the fresh planner output");
+  gate(/^0x[0-9a-fA-F]{64}$/.test(hash), "args", "--tx must be a 32-byte transaction hash");
+  const [tx, receipt] = await Promise.all([getTransaction(hash), getReceipt(hash)]);
+  gate(tx, "transaction", "transaction was not found on Base");
+  const target = tx.to ? normalizeAddress(tx.to) : null;
+  let receiptInput;
+  try {
+    receiptInput = stripErc8021Suffix(tx.input);
+  } catch (error) {
+    throw new GateError("calldata-suffix", error.message);
+  }
+  const dataSelector = txSelector(receiptInput.calldata);
+  const action = target ? knownActionBySelector(target, dataSelector) : null;
+  gate(action, "allowlist", "transaction target/selector is not a recognized Punk Town user operation", { target, selector: dataSelector });
+  const decodedArgs = decodeKnownAction(action, receiptInput.calldata);
+  const from = normalizeAddress(tx.from);
+  gate(from === wallet, "signer", "transaction sender does not match --wallet", { from, wallet });
+  const actualChainId = Number(BigInt(tx.chainId));
+  const actualValue = normalizedUintString(tx.value, "transaction value");
+  gate(actualChainId === 8453, "chain", "submitted transaction is not on Base chainId 8453", { actualChainId });
+  gate(actualValue === "0", "value", "Punk Town write transactions must carry zero native value", { actualValue });
+  const computedInspectionKey = inspectionKey(wallet, {
+    to: target,
+    data: receiptInput.calldata,
+    value: actualValue,
+    chainId: actualChainId,
+  }, parsedContext.hex);
+  gate(computedInspectionKey === suppliedInspectionKey, "plan-binding", "mined transaction envelope or context does not match the fresh planner inspectionKey", {
+    suppliedInspectionKey, computedInspectionKey,
+  });
+  if (action.name === "approve") {
+    gate(["buy", "sell", "stake", "upgrade", "weth-topup", "reserve-topup"].includes(parsedContext.context.action), "plan-context", "approval receipt context has an invalid planner intent");
+  } else {
+    gate(CONTEXT_ACTIONS[parsedContext.context.action]?.includes(action.name), "plan-context", "receipt selector does not match the planner context action", {
+      contextAction: parsedContext.context.action,
+      receiptAction: action.name,
+    });
+  }
+  if (!receipt) {
+    out({
+      ok: false,
+      command,
+      state: "pending-or-unavailable",
+      hash,
+      target,
+      action,
+      selector: dataSelector,
+      from,
+      decodedArgs,
+      inspectionContext: parsedContext.context,
+      inspectionKey: computedInspectionKey,
+      attribution: receiptInput.attribution,
+      next: "This is not completion. Do not submit another write or replay the intent; wait for this exact hash to reach a confirmed receipt.",
+    }, 1);
+    return;
+  }
+  const recognizedEvents = receipt.logs.map(decodeRecognizedLog).filter(Boolean);
+  const success = BigInt(receipt.status) === 1n;
+  let postconditions = [];
+  if (success) {
+    try {
+      postconditions = await durableReceiptProof(action, target, decodedArgs, from, receipt, recognizedEvents, parsedContext.context);
+    } catch (error) {
+      postconditions = [{ name: "durable receipt proof", pass: false, actual: error.message, expected: "all bound events decodable" }];
+    }
+  }
+  const proven = success && postconditions.every((check) => check.pass);
+  out({
+    ok: proven,
+    command,
+    state: !success ? "confirmed-revert" : proven ? "confirmed-and-receipt-proven" : "mined-success-proof-incomplete",
+    hash,
+    blockNumber: BigInt(receipt.blockNumber),
+    target,
+    action,
+    selector: dataSelector,
+    from,
+    decodedArgs,
+    inspectionContext: parsedContext.context,
+    inspectionKey: computedInspectionKey,
+    attribution: receiptInput.attribution,
+    recognizedEvents,
+    postconditions,
+    proofScope: "durable receipt envelope and events; operation-specific fresh state read remains required",
+    receiptStatus: receipt.status,
+    next: proven ? "Durable receipt envelope and expected events passed. Run the operation-specific fresh read command before reporting full completion or starting a dependent write." : success ? "Do not call this complete or submit another write; inspect the failed receipt proof and recover from fresh chain state." : "Do not replay automatically. Re-plan from current chain state and diagnose the revert.",
+  }, proven ? 0 : 1);
+}
+
+async function inspectCalldata() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const target = normalizeAddress(need("to"));
+  const data = need("data");
+  const chainId = Number(integerArg("chain-id", { min: 1n, max: 0xffff_ffffn }));
+  const value = normalizedUintString(need("value"), "--value");
+  const parsedContext = decodeInspectionContext(need("context"));
+  const suppliedInspectionKey = need("plan-key").toLowerCase();
+  gate(/^0x[0-9a-f]{64}$/.test(suppliedInspectionKey), "args", "--plan-key must be the 32-byte inspectionKey from the fresh planner output");
+  gate(chainId === 8453, "chain", "--chain-id must be Base 8453", { chainId });
+  gate(value === "0", "value", "--value must be zero for every Punk Town write", { value });
+  gate(/^0x[0-9a-fA-F]{8}([0-9a-fA-F]{64})*$/.test(data), "args", "--data must be canonical ABI calldata (selector plus whole words)");
+  const computedInspectionKey = inspectionKey(wallet, { to: target, data, value, chainId }, parsedContext.hex);
+  gate(computedInspectionKey === suppliedInspectionKey, "plan-binding", "chain, value, target, calldata, wallet, or context does not match the fresh planner inspectionKey", {
+    suppliedInspectionKey, computedInspectionKey,
+  });
+  const dataSelector = txSelector(data);
+  const action = knownActionBySelector(target, dataSelector);
+  gate(action, "allowlist", "target/selector is not a recognized Punk Town user operation", { target, selector: dataSelector });
+  const decodedArgs = decodeKnownAction(action, data);
+  const validation = await validateKnownAction(target, action, decodedArgs, wallet, parsedContext.context);
+  const preflight = await simulation({ to: target, data }, wallet);
+
+  out({
+    ok: true,
+    command,
+    chainId,
+    target,
+    selector: dataSelector,
+    action,
+    wallet,
+    inspectionKey: computedInspectionKey,
+    inspectionContext: parsedContext.context,
+    decodedArgs,
+    validation,
+    preflight,
+    valueRequired: value,
+    next: "The allowlist, canonical ABI arguments, signer-sensitive ownership, fresh FIFO/deadline constraints, and approval spender passed. Submit only the matching fresh planner output through Bankr after explicit confirmation.",
+  });
+}
+
+const COMMANDS = {
+  verify: commandVerify,
+  status: commandStatus,
+  inventory: commandInventory,
+  punk: commandPunk,
+  crew: commandCrew,
+  rewards: commandRewards,
+  "plan-buy": planBuy,
+  "plan-sell": planSell,
+  "plan-stake": planStake,
+  "plan-upgrade": planUpgrade,
+  "plan-unstake": planUnstake,
+  "plan-settle": planSettle,
+  "plan-settle-all": planSettleAll,
+  "plan-claim": planClaim,
+  "plan-claim-batch": planClaimBatch,
+  "plan-claim-all": planClaimAll,
+  "plan-claim-lossy": planClaimLossy,
+  "plan-forfeit": planForfeit,
+  "plan-convert": planConvert,
+  "plan-weth-topup": planWethTopup,
+  "plan-reserve-topup": planReserveTopup,
+  "plan-sync-donation": planSyncDonation,
+  "plan-evict-head": planEvictHead,
+  "plan-poke-bootstrap": planPokeBootstrap,
+  "inspect-calldata": inspectCalldata,
+  "inspect-tx": inspectTx,
+};
+
+const COMMAND_FLAGS = Object.freeze({
+  verify: ["wallet"],
+  status: ["wallet"],
+  inventory: ["wallet", "cursor", "limit"],
+  punk: ["wallet", "token-id"],
+  crew: ["wallet"],
+  rewards: ["wallet"],
+  "plan-buy": ["wallet", "expected-token-id", "slippage-bps"],
+  "plan-sell": ["wallet", "token-id", "slippage-bps"],
+  "plan-stake": ["wallet", "token-id", "tier", "beneficiary"],
+  "plan-upgrade": ["wallet", "position-id", "new-tier"],
+  "plan-unstake": ["wallet", "position-id", "recipient"],
+  "plan-settle": ["wallet", "position-id"],
+  "plan-settle-all": ["wallet"],
+  "plan-claim": ["wallet", "token", "recipient"],
+  "plan-claim-batch": ["wallet", "tokens", "recipient"],
+  "plan-claim-all": ["wallet", "recipient"],
+  "plan-claim-lossy": ["wallet", "token", "min-received", "recipient"],
+  "plan-forfeit": ["wallet", "token", "amount"],
+  "plan-convert": ["wallet", "amount-weth"],
+  "plan-weth-topup": ["wallet", "amount-weth", "source-id"],
+  "plan-reserve-topup": ["wallet", "amount-baes"],
+  "plan-sync-donation": ["wallet"],
+  "plan-evict-head": ["wallet"],
+  "plan-poke-bootstrap": ["wallet"],
+  "inspect-calldata": ["wallet", "to", "data", "chain-id", "value", "context", "plan-key"],
+  "inspect-tx": ["wallet", "tx", "context", "plan-key"],
+});
+
+async function main() {
+  gate(!argumentParseError, "args", argumentParseError ?? "invalid arguments");
+  gate(command && COMMANDS[command], "command", `unknown command. Available: ${Object.keys(COMMANDS).join(", ")}`);
+  const allowedFlags = new Set(COMMAND_FLAGS[command]);
+  const unknownFlags = Object.keys(args).filter((flag) => !allowedFlags.has(flag));
+  gate(unknownFlags.length === 0, "args", `unknown flag(s) for ${command}: ${unknownFlags.map((flag) => `--${flag}`).join(", ")}`);
+  await COMMANDS[command]();
+}
+
+try {
+  await main();
+} catch (error) {
+  if (error instanceof GateError) {
+    out({ ok: false, command: command ?? null, gate: error.gate, detail: error.message, ...error.extra }, 1);
+  } else {
+    const data = revertData(error);
+    out({
+      ok: false,
+      command: command ?? null,
+      gate: data ? "rpc-revert" : "unexpected",
+      detail: data ? describeRevert(data) : error.message,
+      revertSelector: data?.slice(0, 10) ?? null,
+    }, 1);
+  }
+}
