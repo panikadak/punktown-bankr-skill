@@ -1,4 +1,4 @@
 interface:
   display_name: "Punk Town"
   short_description: "Operate every Punk Town user flow through Bankr"
-  default_prompt: "Use $punktown to inspect or operate Punk Town on Base from my active Bankr EVM wallet. Verify the reviewed deployment, plan and decode every unsigned transaction, use exact approvals, confirm each fresh economic step, then require mined receipts, expected events, and fresh state postconditions."
+  default_prompt: "Use $punktown to inspect, join, or operate Punk Town on Base from my active Bankr EVM wallet. If BAES is short, bind and confirm one concrete Bankr acquisition before buying; then plan and decode each Punk Town transaction, use exact approvals, and require mined receipts, expected events, and fresh state postconditions."

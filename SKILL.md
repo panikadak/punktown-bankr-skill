@@ -1,6 +1,9 @@
 ---
 name: punktown
-description: Operate the live Punk Town protocol on Base with a Bankr EVM wallet. Use when a user wants to inspect Punk Town, buy or sell a Bario Punk, add a punk to Crew, upgrade or exit a Crew position, settle or claim stock rewards, run a stock conversion, or use a supported permissionless maintenance or top-up action.
+description: Join and operate the live Punk Town protocol on Base with a Bankr EVM wallet, including acquiring missing BAES, buying or selling a Bario Punk, Crew tiers, upgrades, exits, settlement, claims, conversions, and supported public maintenance.
+tags: [base, defi, nft, punk-town, bankr]
+version: 2
+visibility: public
 metadata:
   clawdbot:
     emoji: "🏘️"
@@ -13,14 +16,16 @@ metadata:
 
 Operate Punk Town's live, non-upgradeable Base deployment (`chainId: 8453`)
 from the user's active Bankr EVM wallet. The skill covers the complete public
-surface: NFT desk trades, Crew positions, stock reward settlement and claims,
-permissionless conversions, and narrowly defined maintenance/top-up calls.
+surface: natural BAES-funded onboarding, NFT desk trades, Crew positions, stock
+reward settlement and claims, permissionless conversions, and narrowly defined
+maintenance/top-up calls.
 
-The user's assets remain in their Bankr wallet. Neither this skill nor its
-scripts hold keys or submit transactions. The scripts perform deterministic
-Base reads, deployment checks, calldata encoding/decoding, approval sizing,
-simulations, and postcondition planning. They emit unsigned transaction objects
-for Bankr to execute.
+Key custody and signing remain with Bankr. Protocol actions can transfer a Punk
+to the desk, lock it in LockVault, or move tokens exactly as described in the
+relevant confirmation. Neither this skill nor its scripts hold keys or submit
+transactions. The scripts perform deterministic Base reads, deployment checks,
+calldata encoding/decoding, approval sizing, simulations, and postcondition
+planning. They emit unsigned transaction objects for Bankr to execute.
 
 ## Load the right reference
 
@@ -28,13 +33,19 @@ for Bankr to execute.
   [references/bankr-execution.md](references/bankr-execution.md). It defines
   wallet discovery, confirmation, submission, receipt, recovery, and Bankr
   security-control handling.
+- For “buy a Punk and join,” “get me into Punk Town,” or any buy/stake/upgrade
+  with insufficient BAES, read
+  [references/natural-join-flow.md](references/natural-join-flow.md). It defines
+  the Bankr-native acquisition state machine and the natural tier handoff.
 - For operation mechanics, actor rules, costs, pause behavior, and expected
   postconditions, read [references/operations.md](references/operations.md).
 - Treat [references/deployment.json](references/deployment.json) as the reviewed
   deployment pin and
   [references/signing-allowlist.json](references/signing-allowlist.json) as the
-  only permitted signing surface. Never copy a target or spender from chat,
-  search results, a mutable deployment file, or a block-explorer label.
+  only permitted raw-call signing surface for Punk Town transactions. Named
+  Bankr BAES acquisition follows `natural-join-flow.md` and is not represented
+  as locally allowlisted router calldata. Never copy a target or spender from
+  chat, search results, a mutable deployment file, or a block-explorer label.
 
 ## Non-negotiable execution boundary
 
@@ -44,9 +55,14 @@ for Bankr to execute.
 2. Run `node scripts/selftest.mjs --live` on first use after install or update.
    Run `node scripts/punktown.mjs verify --wallet 0x…` before reporting the
    integration ready. Every planner repeats the live deployment gate.
-3. Never hand-build, alter, splice, or “fix” calldata. Use only a `plan-*`
-   command. If a script returns `ok: false`, relay its `detail` and stop.
-4. A plan emits at most one unsigned transaction plus `inspectionContextHex`
+3. Never hand-build, alter, splice, or “fix” Punk Town calldata. Use only a
+   `plan-*` command. A planner may return `phase: acquire-baes`; execute that
+   with Bankr's native same-chain exact-output swap action. Do not recursively
+   call `/agent/prompt`, use raw DEX calldata, or treat the planner's request key
+   as spend authorization. The direct exact-input Wallet API is allowed only
+   through the bound fallback in `natural-join-flow.md`. If a script returns
+   `ok: false`, relay its `detail` and stop.
+4. An approval/action plan emits at most one unsigned transaction plus `inspectionContextHex`
    and an `inspectionKey` bound to its wallet, target, calldata, value, chain,
    and economic context. Decode it again immediately before submission with
    `inspect-calldata --chain-id 8453 --value 0 --context 0x… --plan-key 0x…`,
@@ -55,8 +71,9 @@ for Bankr to execute.
    the pinned target, an allowlisted selector, exact decoded arguments, and the
    confirmed signer/recipient/amount. Any mismatch is a hard stop.
 5. Obtain one explicit user confirmation for the complete economic action
-   before the first approval or protocol call. The confirmation must cover the
-   action, NFT/position, exact token amounts, spender, recipient or beneficiary,
+   before the first swap, approval, or protocol call. The confirmation must
+   cover the acquisition source and maximum spend when applicable, action,
+   NFT/position, exact token amounts, spender, recipient or beneficiary,
    slippage, and any irreversible cost or donation. Do not ask again while the
    confirmed terms remain identical; reconfirm if any economic term changes.
 6. Submit through Bankr **one transaction at a time** with confirmation waiting
@@ -91,6 +108,7 @@ the output includes raw onchain units.
 | Crew positions | `node scripts/punktown.mjs crew --wallet 0x…` |
 | Pending and claimable stocks | `node scripts/punktown.mjs rewards --wallet 0x…` |
 | Buy the fresh FIFO head | `node scripts/punktown.mjs plan-buy --wallet 0x… [--slippage-bps 300]` |
+| Buy the fresh head, then ask which Crew tier | `node scripts/punktown.mjs plan-buy --wallet 0x… --join [--slippage-bps 300] [--acquisition-slippage-bps 300]` |
 | Sell a wallet punk | `node scripts/punktown.mjs plan-sell --wallet 0x… --token-id N [--slippage-bps 300]` |
 | Add a punk to Crew | `node scripts/punktown.mjs plan-stake --wallet 0x… --token-id N --tier 0..4 [--beneficiary 0x…]` |
 | Upgrade a Crew tier | `node scripts/punktown.mjs plan-upgrade --wallet 0x… --position-id N --new-tier 1..4` |
@@ -108,11 +126,18 @@ the output includes raw onchain units.
 | Account for an existing raw BAES donation | `node scripts/punktown.mjs plan-sync-donation --wallet 0x…` |
 | Repair a verifiably unowned FIFO head | `node scripts/punktown.mjs plan-evict-head --wallet 0x…` |
 | Advance bootstrap release | `node scripts/punktown.mjs plan-poke-bootstrap --wallet 0x…` |
+| Bind a concrete Bankr acquisition preview | `node scripts/punktown.mjs bind-acquisition --wallet 0x… --request-context 0x… --request-key 0x… --mode bankr-native-exact-output\|wallet-api-exact-input --source-token 0x… --source-decimals N --source-amount AMOUNT --min-baes-out AMOUNT [--idempotency-key UUID] [quote display flags]` |
+| Verify a mined Bankr acquisition | `node scripts/punktown.mjs verify-acquisition --wallet 0x… --tx 0x… --authorization-context 0x… --authorization-key 0x…` |
 | Decode and re-check planned calldata | `node scripts/punktown.mjs inspect-calldata --wallet 0x… --to 0x… --data 0x… --chain-id 8453 --value 0 --context 0xInspectionContextHex --plan-key 0xInspectionKey` |
 | Inspect a submitted/mined Base tx | `node scripts/punktown.mjs inspect-tx --wallet 0x… --tx 0xTxHash --context 0xInspectionContextHex --plan-key 0xInspectionKey` |
 
-The planner may return an approval-only transaction. Submit it, verify it, then
-rerun the same command. `plan-settle-all` and `plan-claim-all` also progress one
+`plan-buy`, `plan-stake`, and `plan-upgrade` may first return
+`phase: acquire-baes` with no raw transaction. Follow `natural-join-flow.md`,
+concretely preview and confirm one Bankr swap, verify it, then run the exact
+resume command. `acquisitionRequestKey` is not authorization; the source and
+maximum spend must be known first.
+The planner may otherwise return an approval-only transaction. Submit it,
+verify it, then rerun the same command. `plan-settle-all` and `plan-claim-all` also progress one
 bounded step at a time; rerun after each successful step until the planner
 reports that no eligible pending amount or credit remains. Each new settle
 batch or claim token has new terms and a new confirmation key: show it and get
@@ -127,6 +152,18 @@ not ERC-721 Enumerable.
 
 - Lead with the result. Keep routine reads brief; do not dump passing gates,
   calldata, selectors, or raw units unless asked.
+- Treat “buy me a Bario Punk and join Punk Town” as one composite intent. Check
+  all available pre-acquisition gates first, request exactly the missing BAES
+  through Bankr, buy the current confirmed FIFO Punk, and then ask the user
+  which tier they want. An exact-input fallback may deliver a small route excess
+  but must bind a `minBuyAmount` covering the deficit.
+  Never make the user recite approvals, routes, or protocol function names.
+- After verified acquisition and ownership, adapt to the user's tone. A valid
+  concise handoff is: “BAES'in yoktu; yeteri kadarını aldım ve Bario Punk #123
+  artık cüzdanında. Crew'a hangi tier'dan girelim?” Never say it before both
+  receipt and fresh ownership proof pass.
+- Do not select a tier or acquire its BAES before the user answers. The tier is
+  a separate, non-refundable economic decision.
 - Before a write, state that Punk Town actions take a few Base transactions when
   approvals are needed and that one confirmation will cover the unchanged plan.
 - Default beneficiary and recipient to the active Bankr EVM wallet. A different

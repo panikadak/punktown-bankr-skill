@@ -34,6 +34,11 @@ also require:
   arbitrary calldata; use a Bankr-native agent execution path only if it
   accepts the same inspected plan, otherwise stop.
 
+Bankr's named swap path is different: swap output returns to the active wallet,
+so an allowed-recipient list does not block `/wallet/swap`. That does not make a
+later raw Punk Town call eligible; approval and protocol targets must still pass
+the arbitrary-call policy independently.
+
 Do not ask a user to weaken a safety control just to make a transaction pass.
 Explain the control that blocked the action and stop. A recipient allowlist or
 spending limit may be intentionally incompatible with opaque contract calldata.
@@ -43,6 +48,45 @@ website.
 Bankr credentials are secrets. Use the authenticated runtime or environment;
 do not embed headers, keys, cookies, or tokens in a skill file, plan output,
 shell history, log, issue, or chat response.
+
+### Native BAES acquisition
+
+When `plan-buy`, `plan-stake`, or `plan-upgrade` returns
+`phase: acquire-baes`, follow `natural-join-flow.md`. The primary path is
+Bankr's native same-chain exact-output swap action. Invoke the current agent's
+native swap capability directly; never recursively call `/agent/prompt`.
+
+The planner's `acquisitionRequestKey` binds Base, the active wallet, the pinned
+BAES address, the deficit, slippage ceiling, and the target Punk Town plan. It
+does **not** authorize a source asset or spend amount. Obtain a fresh Bankr
+preview, then run `bind-acquisition --mode bankr-native-exact-output` with the
+concrete source token, maximum source spend, BAES floor, and all available
+fee/impact fields. Get explicit confirmation for its
+`acquisitionAuthorizationKey` before execution. If Bankr cannot expose those
+bounds, stop.
+
+The direct Wallet API is an exact-input fallback, not an exact-output API. Quote
+exact source amounts until `minBuyAmount` covers the deficit, then run
+`bind-acquisition --mode wallet-api-exact-input` with the fresh quote and
+planner request context. In either mode, the command binds source
+address/decimals, exact or maximum input, BAES floor, slippage, available
+fee/impact fields, optional `quoteId`, wallet, Base, and the target plan. The
+Wallet API mode additionally requires and binds a UUID idempotency key. Confirm
+that exact key before one swap.
+
+Bankr may encode native Base ETH as either the zero address or its `0xEeee...`
+sentinel. The binder canonicalizes both to the same authorization, and the
+receipt verifier bounds the native input from transaction `value` instead of an
+ERC-20 `Transfer` log. It does not call that value exact net spend because a
+router may refund unused native input.
+
+After Bankr reports `success: true` and a mined hash, run
+`verify-acquisition` with the authorization context/key. It proves the signer,
+successful Base receipt, ERC-20 debit or native transaction-value bound, BAES
+transfer floor, and fresh required balance. Its scope is deliberately
+Bankr-managed: it does not claim a local DEX target, router calldata, approval,
+native refund, or exact net native-spend proof. Never pass an acquisition object
+to `inspect-calldata`; it is not Punk Town calldata.
 
 ## 3. First-use gate
 
@@ -75,6 +119,8 @@ extract partial calldata from a failed run.
 Expected top-level behavior:
 
 - `ok: false`: gate failure. Relay `detail` and stop.
+- `ok: true`, `phase: acquire-baes`: no raw transaction exists. Quote, concretely
+  bind, confirm, and verify one Bankr swap before the exact `next` planner run.
 - `ok: true`, empty `txs`: no write is needed or a terminal read/report was
   produced.
 - `ok: true`, one `txs` entry: one unsigned Base transaction is ready for
@@ -99,15 +145,19 @@ transaction, show:
 - final target and method in plain language;
 - beneficiary or recipient;
 - slippage/deadline for NFT fee conversion;
+- for BAES acquisition, the source token, exact or maximum input, BAES output
+  floor, Bankr fee/impact fields when available, and acquisition slippage;
 - non-refundable Crew cost, destructive credit effect, or irreversible donation;
 - expected number and order of transaction phases.
 
 One explicit “yes” can authorize all phases of an unchanged plan. It does not
 authorize changed economic terms. Reconfirm when a fresh plan changes the FIFO
-head, token/position, amount, tier, beneficiary, recipient, spender, slippage,
-or destructive effect. A refreshed deadline or quote within the already
-confirmed slippage bound does not need a second prompt unless it materially
-changes the presented minimum or user outcome.
+head, token/position, source asset, maximum spend, output floor, fee/impact,
+amount, tier, beneficiary, recipient, spender, slippage, or destructive effect.
+A refreshed deadline or Punk Town fee quote within the already confirmed
+slippage bound does not need a second prompt unless it materially changes the
+presented minimum or user outcome. A BAES acquisition re-quote with different
+concrete economics always needs a new authorization binding and confirmation.
 
 `plan-settle-all` and `plan-claim-all` are deliberately stateless across mined
 steps. Every later position batch or token claim produces new terms and a new
@@ -237,6 +287,7 @@ Use the relevant read command after the receipt:
 
 | Action | Fresh read |
 |---|---|
+| BAES acquisition | run the exact `next` planner command; it re-reads `BAES.balanceOf(wallet)` |
 | Approval | rerun the original planner; it re-reads allowance/approval |
 | Buy/sell/evict | `inventory` and `status` |
 | Stake/upgrade/unstake | `crew` and `rewards` |
@@ -253,8 +304,10 @@ unverified,” include the hash, and stop before any dependent transaction.
 
 ```text
 fresh plan-buy
+  -> when short: native exact-output preview, concrete confirmation, one swap
+  -> mined swap success + fresh plan-buy BAES balance proof
   -> exact BAES approval only (when needed)
-  -> confirm full buy once
+  -> reuse the unchanged swap + buy confirmation; otherwise confirm once here
   -> inspect-calldata -> Bankr submit -> mined success -> allowance postcondition
 fresh plan-buy (head, quote, deadline and simulation re-read)
   -> inspect-calldata -> Bankr submit -> mined success
@@ -263,6 +316,10 @@ fresh plan-buy (head, quote, deadline and simulation re-read)
 
 The head can change while approval is mining. If it changes, show the new NFT
 ID and reconfirm because the purchased asset changed.
+
+With `--join`, ask for the Crew tier only after the buy receipt proof and a
+fresh `ownerOf(tokenId) == wallet` read both pass. The earlier confirmation does
+not authorize any non-refundable tier payment.
 
 ### Stake
 
@@ -307,6 +364,12 @@ or use `claimLossy` automatically.
 ### Pending or ambiguous submission
 
 Never send the same intent again merely because the API response timed out.
+
+For `/wallet/swap`, HTTP 200 with `success: false` is a mined failure, not
+success. A `504` means the swap may already be broadcast; a LaunchLab-specific
+`502` may also be ambiguous. Keep the original UUID idempotency key, inspect
+Bankr activity and Base for the original hash, and never create a new key to
+force a retry while the outcome is unknown.
 
 1. If a transaction hash exists, query that exact hash on Base.
 2. If no hash exists, inspect the wallet's Base nonce and recent transactions

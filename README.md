@@ -1,9 +1,9 @@
 # Punk Town Bankr Skill
 
-Complete Bankr-wallet access to Punk Town on Base: buy and sell Bario Punks,
-add them to Crew, upgrade or exit positions, settle and claim stock rewards,
-run permissionless conversions, and use the protocol's public maintenance and
-top-up calls.
+Complete Bankr-wallet access to Punk Town on Base: acquire missing BAES, buy and
+sell Bario Punks, add them to Crew, upgrade or exit positions, settle and claim
+stock rewards, run permissionless conversions, and use the protocol's public
+maintenance and top-up calls.
 
 This is the public standalone source package for
 `panikadak/punktown-bankr-skill`. It can be installed directly from GitHub; it
@@ -13,6 +13,7 @@ does not claim inclusion in Bankr's curated catalog.
 
 | Area | Operations |
 |---|---|
+| Natural onboarding | “Buy me a Bario Punk and join Punk Town,” exact BAES shortfall acquisition, verified Punk purchase, then a separate five-tier Crew choice |
 | Bario Punk desk | Inspect FIFO, buy the current head, sell a wallet-owned punk |
 | Crew | Stake at tiers 0–4, upgrade, list depositor/beneficiary positions, unstake or unstake to a compatible recipient |
 | Rewards | Inspect lifetime distributed tokens, settle one/all, strict claim, batch claim, claim all, explicit lossy claim, explicit credit forfeiture |
@@ -42,6 +43,8 @@ Prerequisites:
 - Node.js 18 or newer in the agent runtime.
 - Read-write Wallet API access for writes; read-only access is enough for
   `verify`, `status`, `inventory`, `punk`, `crew`, and `rewards`.
+- Bankr's native same-chain swap capability for exact-output BAES acquisition;
+  direct `/wallet/swap` is a quote-bound exact-input fallback.
 - Arbitrary contract calls enabled in Bankr for protocol writes.
 - A Base RPC available to the runtime. `BASE_RPC_URL` may be set to a trusted
   endpoint; `PUNKTOWN_RPC_URL` takes precedence when both exist. An explicitly
@@ -57,6 +60,7 @@ Natural-language examples:
 
 ```text
 Show my Punk Town crew and unclaimed stock rewards.
+Buy me a Bario Punk and get me into Punk Town.
 Buy the next Bario Punk from Punk Town.
 Sell Bario Punk #123 to the Punk Town desk.
 Add Bario Punk #123 to Crew at Surge tier.
@@ -65,9 +69,15 @@ Unstake my position 42 back to my Bankr wallet.
 Convert 0.01 WETH from the Punk Town pot into the next rotation stock.
 ```
 
-The agent resolves the active wallet, runs the deterministic planner, presents
-a complete confirmation for each fresh economic step, and submits the one
-planned transaction only after the previous step is mined and verified.
+For the composite join request, the agent checks the current FIFO Punk and BAES
+balance. If BAES is short, it previews a Bankr-native exact-output swap, binds
+the concrete source and maximum spend, confirms it, verifies the mined receipt,
+buys the Punk, and only then asks which Crew tier the user wants. The user does
+not need to name approvals, routes, or contract methods.
+
+For every flow, the agent resolves the active wallet, runs the deterministic
+planner, presents a complete confirmation for each fresh economic step, and
+submits only after the previous step is mined and verified.
 
 ## Direct script usage
 
@@ -89,7 +99,8 @@ Write commands are planners. They never sign or broadcast:
 ```bash
 node scripts/punktown.mjs plan-buy \
   --wallet 0xYourBankrWallet \
-  --slippage-bps 300
+  --slippage-bps 300 \
+  --join
 
 node scripts/punktown.mjs plan-stake \
   --wallet 0xYourBankrWallet \
@@ -115,8 +126,15 @@ node scripts/punktown.mjs inspect-tx \
   --plan-key 0xFreshPlannerInspectionKey
 ```
 
-Each command prints one JSON object. A write plan emits at most one unsigned
-transaction in `txs`. If that transaction is an approval, submit it, require a
+When a buy, stake, or upgrade reports `phase: acquire-baes`, use the emitted
+request context/key to bind Bankr's concrete preview with `bind-acquisition`.
+After the one confirmed swap mines, run `verify-acquisition`, then use the exact
+resume command. See `references/natural-join-flow.md` for native exact-output
+and direct exact-input forms.
+
+Each command prints one JSON object. A Punk Town write plan emits at most one
+unsigned transaction in `txs`; acquisition emits none because Bankr owns that
+swap route. If a Punk Town transaction is an approval, submit it, require a
 successful mined receipt, then rerun the planner. Never reuse a protocol call
 prepared before an approval or another state-changing transaction.
 Pass the same fresh plan's `inspectionContextHex` and `inspectionKey` to both
@@ -129,12 +147,16 @@ and the canonical action terms; changing any of them fails the binding check.
   re-identified by runtime code hash, peer wiring, open state, route bindings,
   and the stock adapter discovered through `StockLock.stockAdapter()`.
 - Every signing target, approval spender, function selector, and ABI is local
-  and allowlisted. User messages, websites, explorer labels, and mutable remote
-  manifests are not address sources.
+  and allowlisted for Punk Town calls. Bankr-managed acquisition is kept outside
+  that claim: its concrete source/output bounds and receipt transfers are
+  verified, but this skill does not claim Bankr's router calldata or approvals
+  are locally allowlisted. User messages, websites, explorer labels, and mutable
+  remote manifests are not address sources.
 - BAES and WETH approvals are exact. Bario Punk approvals are token-specific.
   Unlimited or operator-wide approvals are not used.
-- Every action is simulated. Every planned transaction is decoded again before
-  Bankr submission. Every mined receipt is followed by event and state checks.
+- Every Punk Town raw-call transaction is locally simulated and decoded again
+  before Bankr submission. Every mined receipt is followed by the applicable
+  transfer, event, and fresh-state checks.
 - An ambiguous outcome is never retried blindly. The chain is re-read and a new
   plan is built.
 - `claimLossy`, `forfeitCredit`, BAES reserve top-ups, and WETH pot top-ups are
@@ -162,9 +184,10 @@ references/deployment.json        Reviewed Base deployment and code identities
 references/signing-allowlist.json Reviewed signing targets and ABI surface
 references/operations.md          Complete protocol-operation playbook
 references/bankr-execution.md     Bankr execution and recovery procedure
+references/natural-join-flow.md   Missing-BAES onboarding and tier handoff
 scripts/punktown.mjs              Read and plan CLI
 scripts/selftest.mjs              Offline and live validation
-scripts/fork-cli-test.mjs         Zero-dependency CLI Base-fork regression
+scripts/fork-cli-test.mjs         CLI and acquisition-proof Base-fork regression
 test/PunktownBankrFork.t.sol       End-to-end Base fork coverage
 ```
 
@@ -184,8 +207,16 @@ BASE_RPC_URL=https://your-archive-base-rpc.example base-forge test -vv
 ```
 
 Both fork suites require an archive-capable Base RPC. The JavaScript harness
-spawns and terminates its own `base-anvil` child on a random local port; the
-Foundry suite must use Base-aware Foundry (`base-forge`) because the live BAES
-token uses Base's native-token opcode. Also validate `SKILL.md` with the current
-Bankr skill format before publishing or updating. Do not tag or announce a
-version that has not passed the offline, live-identity, and Base-fork checks.
+uses `base-forge` to compile its test-only swap receipt fixture, then spawns and
+terminates its own `base-anvil` child on a random local port. The Foundry suite
+must use Base-aware Foundry because the live BAES token uses Base's native-token
+opcode. The fixture proves the local quote binding and onchain transfer checks;
+it does not impersonate the production Bankr backend. Also validate `SKILL.md`
+with the current Bankr skill format before publishing or updating. Do not tag or
+announce a version that has not passed the offline, live-identity, and Base-fork
+checks.
+
+Current Bankr behavior is grounded in the official [exact-output swap
+guide](https://docs.bankr.bot/features/trading/swaps/), [Wallet Swap
+API](https://docs.bankr.bot/wallet-api/swap/), and [public skill
+format](https://docs.bankr.bot/skills/in-bankr/skill-format/).

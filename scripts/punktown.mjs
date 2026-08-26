@@ -58,6 +58,13 @@ import {
 } from "./lib/protocol.mjs";
 
 const [, , command, ...argv] = process.argv;
+const BANKR_NATIVE_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+function isNativeToken(address) {
+  const normalized = normalizeAddress(address);
+  return normalized === ZERO_ADDRESS || normalized === BANKR_NATIVE_TOKEN;
+}
+
 const args = {};
 let argumentParseError = null;
 for (let index = 0; index < argv.length; index += 1) {
@@ -109,6 +116,28 @@ function integerArg(name, { min = 0n, max = (1n << 256n) - 1n, required = true }
 
 function walletArg() {
   return normalizeAddress(need("wallet"));
+}
+
+function booleanFlag(name) {
+  const value = args[name];
+  gate(value === undefined || value === true, "args", `--${name} is a flag and does not take a value`);
+  return value === true;
+}
+
+function acquisitionSlippageBps() {
+  return args["acquisition-slippage-bps"] === undefined
+    ? 300n
+    : integerArg("acquisition-slippage-bps", { min: 10n, max: 1000n });
+}
+
+function optionalBoundedTextArg(name, { maxLength = 256, pattern = null } = {}) {
+  const value = args[name];
+  if (value === undefined) return null;
+  gate(value !== true && typeof value === "string", "args", `--${name} requires a value`);
+  gate(value.length > 0 && value.length <= maxLength, "args", `--${name} must contain 1..${maxLength} characters`);
+  gate(!/[\u0000-\u001f\u007f]/.test(value), "args", `--${name} must not contain control characters`);
+  if (pattern) gate(pattern.test(value), "args", `--${name} has an invalid format`);
+  return value;
 }
 
 function recipientArg(wallet) {
@@ -235,7 +264,7 @@ function inspectionKey(wallet, tx, contextHex) {
   }));
 }
 
-async function finalPlan({ action, wallet, tx, terms, report, expectedEvents, postconditions, warnings = [], reads = {} }) {
+async function finalPlan({ action, wallet, tx, terms, report, expectedEvents, postconditions, warnings = [], reads = {}, afterSuccess = null }) {
   const preflight = await simulation(tx, wallet);
   const inspection = encodeInspectionContext(action, terms);
   return {
@@ -256,6 +285,7 @@ async function finalPlan({ action, wallet, tx, terms, report, expectedEvents, po
     preflight: { ...preflight, returnData: preflight.returnData || "0x" },
     expectedEvents,
     postconditions,
+    ...(afterSuccess ? { afterSuccess } : {}),
     submitRule: "Show the report and terms. Use an existing explicit confirmation only when it covers this exact confirmationKey and unchanged terms; otherwise obtain confirmation. Re-run immediately before submission, require the same confirmationKey, then submit this one tx with waitForConfirmation=true. Require a successful receipt and postconditions. Never replay an unknown outcome.",
   };
 }
@@ -307,6 +337,322 @@ async function erc20Approval(token, spender, required, wallet, label) {
     allowance,
     approvalAmount,
   };
+}
+
+async function baesAcquisitionPlan({ action, wallet, required, maxSlippageBps, terms, report, warnings, resume }) {
+  const balance = await readUint(ADDR.baes, SIG.balanceOf, ["address"], [wallet]);
+  if (balance >= required) return { emitted: false, balance };
+
+  const deficit = required - balance;
+  const targetConfirmationKey = confirmationKey(action, terms);
+  const acquisitionTerms = {
+    chainId: 8453,
+    wallet,
+    targetAction: action,
+    targetConfirmationKey,
+    outputToken: normalizeAddress(ADDR.baes),
+    startingBalance: balance,
+    requiredBalance: required,
+    minimumOutput: deficit,
+    maxSlippageBps,
+  };
+  const requestContext = encodeInspectionContext("acquire-baes-request", acquisitionTerms);
+  const requestKey = confirmationKey("acquire-baes-request", acquisitionTerms);
+  out({
+    ok: true,
+    command,
+    phase: "acquire-baes",
+    deployment: { commit: DEPLOYMENT.release.commit, integrity: true },
+    wallet,
+    reads: { baesBalance: balance, requiredBaesBalance: required, baesDeficit: deficit },
+    terms,
+    confirmationKey: targetConfirmationKey,
+    acquisitionRequestContext: requestContext.context,
+    acquisitionRequestContextHex: requestContext.hex,
+    acquisitionRequestKey: requestKey,
+    report,
+    warnings,
+    txs: [],
+    acquisition: {
+      provider: "Bankr",
+      operation: "bankr-native-same-chain-exact-output",
+      fromChain: "base",
+      toChain: "base",
+      chainId: 8453,
+      outputToken: {
+        symbol: "BAES",
+        address: normalizeAddress(ADDR.baes),
+        decimals: 18,
+      },
+      currentBalance: balance,
+      requiredBalance: required,
+      requestedOutput: deficit,
+      requestedOutputHuman: formatUnits(deficit, 18),
+      requestedOutputMode: "exact-output",
+      maxSlippageBps,
+      sourcePolicy: "Prefer an asset the user named. Without one, automatically suggest only sufficient native ETH, WETH, or verified Base USDC and preserve native ETH needed for gas. Any other fungible asset requires an explicit user choice; never auto-sell a tokenized stock, NFT, Crew reward credit, or unrelated asset. Never use another chain, wallet, recipient, or Punk Town's one-way fee adapter.",
+      primaryRule: `Use Bankr's native same-chain exact-output swap action for exactly ${formatUnits(deficit, 18)} BAES at the pinned contract address on Base. Invoke the current agent's native swap capability directly; do not recursively call /agent/prompt. Require Bankr's fresh preview to show the source asset, maximum source spend, fees, price impact, exact BAES output, and slippage. Run bind-acquisition in bankr-native-exact-output mode, then obtain explicit confirmation for its concrete acquisitionAuthorizationKey plus the unchanged targetConfirmationKey.`,
+      requestBindingRule: `The acquisitionRequestKey ${requestKey} binds the wallet, Base, BAES deficit, slippage ceiling, and target Punk Town plan. It is an integrity request only; it cannot authorize a source asset or spend amount that Bankr has not yet quoted.`,
+      fallbackRule: "If native exact-output is unavailable but direct Wallet API access exists, use POST /wallet/swap-quote with exact source amounts until minBuyAmount covers the deficit, then run bind-acquisition in wallet-api-exact-input mode with this request context/key and the fresh quote. Confirm its acquisitionAuthorizationKey before one exact-input POST /wallet/swap. Never treat an estimated output as a floor.",
+      executionRule: "Never use /wallet/submit or hand-built DEX calldata for BAES acquisition. Never execute a swap whose concrete source token and maximum source spend were not shown and confirmed.",
+      successRule: `Accept one acquisition attempt only after Bankr reports a successful mined swap and a fresh Base balanceOf read proves at least ${required} BAES base units. A hash, pending response, HTTP 2xx, or quoted output is not success.`,
+      unknownOutcomeRule: "Never blind-retry a timeout, 504, ambiguous 502, pending transaction, or missing confirmation. Recover the original hash/outcome from Bankr activity and Base before any new swap.",
+    },
+    next: `After one confirmed Bankr BAES acquisition, run exactly: ${resume}. Continue only if the fresh planner no longer returns acquire-baes. If the balance is still short, stop and obtain a new concrete quote and confirmation; do not buy twice under the old authorization.`,
+  });
+  return { emitted: true, balance };
+}
+
+async function bindAcquisition() {
+  const wallet = walletArg();
+  const parsedContext = decodeInspectionContext(need("request-context"));
+  const suppliedRequestKey = need("request-key").toLowerCase();
+  gate(/^0x[0-9a-f]{64}$/.test(suppliedRequestKey), "args", "--request-key must be the 32-byte acquisitionRequestKey from a fresh planner");
+  gate(parsedContext.context.action === "acquire-baes-request", "acquisition-binding", "request context is not a BAES acquisition request");
+  const request = parsedContext.context.terms;
+  const computedRequestKey = confirmationKey("acquire-baes-request", request);
+  gate(computedRequestKey === suppliedRequestKey, "acquisition-binding", "request context does not match acquisitionRequestKey", {
+    suppliedRequestKey,
+    computedRequestKey,
+  });
+  gate(Number(request.chainId) === 8453, "acquisition-binding", "acquisition request must stay on Base 8453");
+  gate(normalizeAddress(request.wallet) === wallet, "acquisition-binding", "active wallet does not match the acquisition request");
+  gate(normalizeAddress(request.outputToken) === normalizeAddress(ADDR.baes), "acquisition-binding", "acquisition output is not the pinned BAES token");
+  const minimumOutput = BigInt(request.minimumOutput);
+  gate(minimumOutput > 0n, "acquisition-binding", "acquisition minimum output must be positive");
+  const maxSlippageBps = BigInt(request.maxSlippageBps);
+  gate(maxSlippageBps >= 10n && maxSlippageBps <= 1000n, "acquisition-binding", "acquisition slippage is outside the planner bound");
+
+  const mode = need("mode");
+  gate(
+    mode === "bankr-native-exact-output" || mode === "wallet-api-exact-input",
+    "args",
+    "--mode must be bankr-native-exact-output or wallet-api-exact-input",
+  );
+  const requestedSourceToken = normalizeAddress(need("source-token"));
+  // Bankr surfaces both the zero address and 0xEeee... for Base ETH. Bind
+  // either spelling to one canonical API/receipt representation so the same
+  // preview cannot produce different authorization keys.
+  const sourceToken = isNativeToken(requestedSourceToken) ? BANKR_NATIVE_TOKEN : requestedSourceToken;
+  gate(sourceToken !== normalizeAddress(ADDR.baes), "acquisition-quote", "source token cannot be BAES");
+  const sourceSymbol = optionalBoundedTextArg("source-symbol", { maxLength: 32, pattern: /^[A-Za-z0-9._+\- ]+$/ });
+  const sourceDecimals = Number(integerArg("source-decimals", { min: 0n, max: 255n }));
+  if (isNativeToken(sourceToken)) {
+    gate(sourceDecimals === 18, "acquisition-quote", "Base native ETH must use 18 decimals");
+  }
+  const sourceAmount = amountArg("source-amount", sourceDecimals);
+  const minBaesOut = amountArg("min-baes-out", 18);
+  if (mode === "bankr-native-exact-output") {
+    gate(minBaesOut === minimumOutput, "acquisition-quote", "Bankr exact-output preview must equal the requested BAES deficit", {
+      minBaesOut,
+      requiredExactBaesOut: minimumOutput,
+    });
+  } else {
+    gate(minBaesOut >= minimumOutput, "acquisition-quote", "Bankr quote minBuyAmount does not cover the BAES deficit", {
+      minBaesOut,
+      requiredMinBaesOut: minimumOutput,
+    });
+  }
+  const idempotencyKey = optionalBoundedTextArg("idempotency-key", {
+    maxLength: 36,
+    pattern: /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/,
+  });
+  if (mode === "wallet-api-exact-input") {
+    gate(idempotencyKey, "args", "--idempotency-key is required for wallet-api-exact-input");
+  } else {
+    gate(idempotencyKey === null, "args", "--idempotency-key applies only to wallet-api-exact-input");
+  }
+  const quoteId = optionalBoundedTextArg("quote-id", { maxLength: 256 });
+  const feeBps = integerArg("fee-bps", { min: 0n, max: 10_000n, required: false });
+  const priceImpactBps = integerArg("price-impact-bps", { min: 0n, max: 1_000_000n, required: false });
+  const swapImpactBps = integerArg("swap-impact-bps", { min: 0n, max: 1_000_000n, required: false });
+  const maxPriceImpactBps = integerArg("max-price-impact-bps", { min: 0n, max: 1_000_000n, required: false });
+  const networkCostsUsd = optionalBoundedTextArg("network-costs-usd", {
+    maxLength: 64,
+    pattern: /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/,
+  });
+  const canonicalSourceAmount = formatUnits(sourceAmount, sourceDecimals);
+  const canonicalMinBaesOut = formatUnits(minBaesOut, 18);
+  const execution = mode === "wallet-api-exact-input"
+    ? {
+        endpoint: "/wallet/swap",
+        request: {
+          fromChain: "base",
+          fromToken: sourceToken,
+          toChain: "base",
+          toToken: normalizeAddress(ADDR.baes),
+          amount: canonicalSourceAmount,
+          minBuyAmount: canonicalMinBaesOut,
+          slippageBps: Number(maxSlippageBps),
+          ...(quoteId ? { quoteId } : {}),
+          idempotencyKey: idempotencyKey.toLowerCase(),
+        },
+      }
+    : {
+        capability: "Bankr native same-chain exact-output swap",
+        intent: {
+          fromChain: "base",
+          fromToken: sourceToken,
+          toChain: "base",
+          toToken: normalizeAddress(ADDR.baes),
+          exactOutput: formatUnits(minimumOutput, 18),
+          maxSourceAmount: canonicalSourceAmount,
+          slippageBps: Number(maxSlippageBps),
+          ...(quoteId ? { quoteId } : {}),
+        },
+      };
+  const authorizationTerms = {
+    chainId: 8453,
+    wallet,
+    mode,
+    acquisitionRequestKey: suppliedRequestKey,
+    targetAction: request.targetAction,
+    targetConfirmationKey: request.targetConfirmationKey,
+    startingBaesBalance: BigInt(request.startingBalance),
+    requiredBaesBalance: BigInt(request.requiredBalance),
+    quote: {
+      sourceToken,
+      sourceSymbol,
+      sourceDecimals,
+      sourceAmountMode: mode === "wallet-api-exact-input" ? "exact-input" : "maximum-input",
+      sourceAmount,
+      sourceAmountHuman: canonicalSourceAmount,
+      outputToken: normalizeAddress(ADDR.baes),
+      minBaesOut,
+      minBaesOutHuman: canonicalMinBaesOut,
+      requestedMinimumBaesOut: minimumOutput,
+      requestedMinimumBaesOutHuman: formatUnits(minimumOutput, 18),
+      slippageBps: maxSlippageBps,
+      feeBps,
+      priceImpactBps,
+      swapImpactBps,
+      maxPriceImpactBps,
+      networkCostsUsd,
+      quoteId,
+      idempotencyKey: idempotencyKey?.toLowerCase() ?? null,
+    },
+    execution,
+  };
+  const acquisitionAuthorizationKey = confirmationKey("authorize-baes-acquisition", authorizationTerms);
+  const authorizationContext = encodeInspectionContext("authorize-baes-acquisition", authorizationTerms);
+  // Symbols are caller-supplied display metadata. Always pair them with the
+  // canonical address so a misleading symbol cannot hide the asset being sold.
+  const sourceLabel = sourceSymbol ? `${sourceSymbol} (${sourceToken})` : sourceToken;
+  const optionalCosts = [
+    feeBps === null ? null : `Bankr fee ${feeBps} bps`,
+    priceImpactBps === null ? null : `display price impact ${priceImpactBps} bps`,
+    swapImpactBps === null ? null : `fee-exclusive swap impact ${swapImpactBps} bps`,
+    networkCostsUsd === null ? null : `estimated network cost $${networkCostsUsd}`,
+  ].filter(Boolean);
+  out({
+    ok: true,
+    command,
+    phase: "acquisition-authorization",
+    wallet,
+    acquisitionRequestKey: suppliedRequestKey,
+    targetAction: request.targetAction,
+    targetConfirmationKey: request.targetConfirmationKey,
+    authorizationTerms,
+    authorizationContext: authorizationContext.context,
+    authorizationContextHex: authorizationContext.hex,
+    acquisitionAuthorizationKey,
+    report: `On Base, spend ${mode === "wallet-api-exact-input" ? "exactly" : "at most"} ${canonicalSourceAmount} ${sourceLabel} for at least ${canonicalMinBaesOut} BAES, with ${maxSlippageBps} bps quoted slippage${optionalCosts.length ? `, ${optionalCosts.join(", ")}` : ""}; then continue only the separately bound ${request.targetAction} plan?`,
+    execution,
+    confirmationRule: "Show this report plus the target Punk Town plan. Obtain one explicit confirmation for this exact acquisitionAuthorizationKey and unchanged targetConfirmationKey. Any source token, source amount, minimum BAES output, fee/impact, quote, slippage, wallet, chain, idempotency key, or target-plan change requires a new binding and confirmation.",
+    submitRule: mode === "wallet-api-exact-input"
+      ? "POST exactly execution.request to Bankr /wallet/swap once. A stale quoteId may be repriced, but the exact source amount and minBuyAmount remain hard bounds."
+      : "Invoke the current Bankr agent's native exact-output swap capability once with execution.intent. Do not recursively call /agent/prompt. The source spend may not exceed maxSourceAmount.",
+    verifyRule: "Require Bankr success:true and a mined hash, then run verify-acquisition with this authorizationContextHex and acquisitionAuthorizationKey. Never pass this object to /wallet/submit or inspect-calldata.",
+  });
+}
+
+async function verifyAcquisition() {
+  await deploymentGate();
+  const wallet = walletArg();
+  const parsedContext = decodeInspectionContext(need("authorization-context"));
+  const suppliedAuthorizationKey = need("authorization-key").toLowerCase();
+  gate(/^0x[0-9a-f]{64}$/.test(suppliedAuthorizationKey), "args", "--authorization-key must be the 32-byte acquisitionAuthorizationKey");
+  gate(parsedContext.context.action === "authorize-baes-acquisition", "acquisition-binding", "authorization context is not a BAES acquisition authorization");
+  const authorization = parsedContext.context.terms;
+  const computedAuthorizationKey = confirmationKey("authorize-baes-acquisition", authorization);
+  gate(computedAuthorizationKey === suppliedAuthorizationKey, "acquisition-binding", "authorization context does not match acquisitionAuthorizationKey", {
+    suppliedAuthorizationKey,
+    computedAuthorizationKey,
+  });
+  gate(Number(authorization.chainId) === 8453, "acquisition-binding", "acquisition authorization must stay on Base 8453");
+  gate(normalizeAddress(authorization.wallet) === wallet, "acquisition-binding", "active wallet does not match the acquisition authorization");
+
+  const hash = need("tx").toLowerCase();
+  gate(/^0x[0-9a-f]{64}$/.test(hash), "args", "--tx must be a 32-byte transaction hash");
+  const [transaction, receipt] = await Promise.all([getTransaction(hash), getReceipt(hash)]);
+  gate(transaction && receipt, "acquisition-pending", "acquisition transaction is pending or unavailable; do not retry", { hash });
+  gate(normalizeAddress(transaction.from) === wallet, "acquisition-receipt", "acquisition signer does not match the active Bankr wallet", {
+    expected: wallet,
+    actual: transaction.from,
+  });
+  gate(BigInt(receipt.status) === 1n, "acquisition-receipt", "acquisition transaction mined with a reverted status", { hash });
+
+  const quote = authorization.quote;
+  const sourceToken = normalizeAddress(quote.sourceToken);
+  const sourceLimit = BigInt(quote.sourceAmount);
+  const minBaesOut = BigInt(quote.minBaesOut);
+  const transferTopic = keccak256("Transfer(address,address,uint256)").toLowerCase();
+  const transferred = (token, direction, account) => receipt.logs.reduce((total, log) => {
+    if (normalizeAddress(log.address) !== normalizeAddress(token)) return total;
+    if (log.topics?.[0]?.toLowerCase() !== transferTopic || log.topics.length !== 3) return total;
+    const indexed = normalizeAddress(`0x${log.topics[direction === "from" ? 1 : 2].slice(-40)}`);
+    if (indexed !== account) return total;
+    return total + BigInt(log.data);
+  }, 0n);
+  const baesReceived = transferred(ADDR.baes, "to", wallet);
+  const nativeSource = isNativeToken(sourceToken);
+  const sourceAmountObserved = nativeSource
+    ? BigInt(transaction.value ?? 0)
+    : transferred(sourceToken, "from", wallet);
+  gate(sourceAmountObserved > 0n, "acquisition-receipt", "acquisition receipt does not prove any bound source input");
+  gate(sourceAmountObserved <= sourceLimit, "acquisition-receipt", "acquisition source input exceeded the confirmed bound", {
+    sourceAmountObserved,
+    sourceLimit,
+  });
+  if (authorization.mode === "wallet-api-exact-input") {
+    gate(sourceAmountObserved === sourceLimit, "acquisition-receipt", "Wallet API exact-input source debit or native value does not equal the confirmed input", {
+      sourceAmountObserved,
+      expected: sourceLimit,
+    });
+  }
+  gate(baesReceived >= minBaesOut, "acquisition-receipt", "acquisition BAES receipt is below the confirmed minimum", {
+    baesReceived,
+    minBaesOut,
+  });
+  const currentBaesBalance = await readUint(ADDR.baes, SIG.balanceOf, ["address"], [wallet]);
+  const requiredBaesBalance = BigInt(authorization.requiredBaesBalance);
+  gate(currentBaesBalance >= requiredBaesBalance, "acquisition-balance", "fresh BAES balance is still below the target action requirement", {
+    currentBaesBalance,
+    requiredBaesBalance,
+  });
+
+  out({
+    ok: true,
+    command,
+    phase: "acquisition-verified",
+    hash,
+    blockNumber: BigInt(receipt.blockNumber),
+    wallet,
+    mode: authorization.mode,
+    sourceToken,
+    sourceAmountObserved,
+    sourceObservation: nativeSource ? "native-transaction-value-sent" : "erc20-transfer-debit",
+    sourceLimit,
+    baesReceived,
+    minBaesOut,
+    currentBaesBalance,
+    requiredBaesBalance,
+    acquisitionAuthorizationKey: computedAuthorizationKey,
+    targetAction: authorization.targetAction,
+    targetConfirmationKey: authorization.targetConfirmationKey,
+    proofScope: "Bankr-managed swap envelope plus ERC-20 debit or native transaction-value bound, BAES transfer floor, and fresh balance; no local DEX target, router calldata, approval, native refund, or net-spend claim",
+    next: "Run the exact resume planner command from the original acquire-baes output. Continue only if it no longer requests acquisition and its targetConfirmationKey remains unchanged.",
+  });
 }
 
 async function nftApproval(spender, tokenId, wallet, label) {
@@ -394,6 +740,8 @@ async function planBuy() {
   await deploymentGate();
   await routeGate("fee");
   const wallet = walletArg();
+  const joinCrew = booleanFlag("join");
+  const maxAcquisitionSlippageBps = acquisitionSlippageBps();
   const inventoryCount = await readUint(ADDR.punkAMM, "inventoryCount()");
   gate(inventoryCount > 0n, "inventory", "Punk Town desk inventory is empty");
   const tokenId = await readUint(ADDR.punkAMM, "fifoHead()");
@@ -417,19 +765,40 @@ async function planBuy() {
     maxBaesIn: BUY_TOTAL,
     slippageBps: quote.slippageBps,
     recipient: wallet,
+    joinCrew,
+    funding: {
+      token: normalizeAddress(ADDR.baes),
+      requiredBaes: BUY_TOTAL,
+      acquireIfShort: true,
+      maxSlippageBps: maxAcquisitionSlippageBps,
+    },
     approval: { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.punkAMM), exactAmount: BUY_TOTAL },
   };
-  const report = `Buy FIFO head Bario Punk #${tokenId} for exactly ${formatUnits(BUY_TOTAL, 18)} BAES max, using at most ${quote.slippageBps} bps WETH fee-conversion slippage and an exact PunkAMM BAES approval if needed?`;
+  const report = joinCrew
+    ? `Buy FIFO head Bario Punk #${tokenId} for exactly ${formatUnits(BUY_TOTAL, 18)} BAES max, using at most ${quote.slippageBps} bps WETH fee-conversion slippage and an exact PunkAMM BAES approval if needed; after verified ownership, ask which Crew tier to enter before spending any tier BAES?`
+    : `Buy FIFO head Bario Punk #${tokenId} for exactly ${formatUnits(BUY_TOTAL, 18)} BAES max, using at most ${quote.slippageBps} bps WETH fee-conversion slippage and an exact PunkAMM BAES approval if needed?`;
   const warnings = codeBearingWallet
     ? ["The wallet has bytecode. The successful preflight is required evidence that the current ERC721-C validator/receiver path accepts this wallet."]
     : [];
+  const resume = `node scripts/punktown.mjs plan-buy --wallet ${wallet} --expected-token-id ${tokenId} --slippage-bps ${quote.slippageBps} --acquisition-slippage-bps ${maxAcquisitionSlippageBps}${joinCrew ? " --join" : ""}`;
+  const acquisition = await baesAcquisitionPlan({
+    action: "buy",
+    wallet,
+    required: BUY_TOTAL,
+    maxSlippageBps: maxAcquisitionSlippageBps,
+    terms,
+    report,
+    warnings,
+    resume,
+  });
+  if (acquisition.emitted) return;
   const approval = await erc20Approval(ADDR.baes, ADDR.punkAMM, BUY_TOTAL, wallet, "6,600,000 BAES for PunkAMM buy");
   if (approval.tx) {
     out(await approvalPlan({
       action: "buy",
       wallet,
       approvals: [approval.tx],
-      after: `node scripts/punktown.mjs plan-buy --wallet ${wallet} --expected-token-id ${tokenId} --slippage-bps ${quote.slippageBps}`,
+      after: resume,
       terms,
       report,
       warnings,
@@ -456,6 +825,12 @@ async function planBuy() {
     postconditions: [`BarioPunks.ownerOf(${tokenId}) == ${wallet}`, "NFTBought.baesIn == 6600000e18", "receipt.status == success"],
     warnings,
     reads: { fifoHead: tokenId, headOwner, inventoryCount, quoteWethOut: quote.quote, minWethOut: quote.minWethOut, quoteBlock: quote.quoteBlock, deadline: quote.deadline },
+    afterSuccess: joinCrew ? {
+      action: "ask-crew-tier",
+      tokenId,
+      instruction: "Only after the receipt proof and fresh ownerOf read pass, tell the user the Punk is in their wallet and ask which Crew tier they want. Do not select or buy tier BAES before they answer.",
+      choices: TIERS.map((tier) => ({ id: tier.id, name: tier.name, costBaes: formatUnits(tier.cost, 18), costRaw: tier.cost, weight: tier.weight })),
+    } : null,
   }));
 }
 
@@ -521,6 +896,7 @@ async function planStake() {
   await deploymentGate();
   await routeGate("stock");
   const wallet = walletArg();
+  const maxAcquisitionSlippageBps = acquisitionSlippageBps();
   const tokenId = integerArg("token-id", { min: 1n });
   const tierId = Number(integerArg("tier", { min: 0n, max: 4n }));
   const tier = TIERS[tierId];
@@ -540,6 +916,12 @@ async function planStake() {
     baesCost: tier.cost,
     weight: tier.weight,
     beneficiary,
+    funding: {
+      token: normalizeAddress(ADDR.baes),
+      requiredBaes: tier.cost,
+      acquireIfShort: true,
+      maxSlippageBps: maxAcquisitionSlippageBps,
+    },
     approvals: [
       { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.lockVault), exactAmount: tier.cost },
       { token: normalizeAddress(ADDR.punks), spender: normalizeAddress(ADDR.lockVault), tokenId },
@@ -550,17 +932,28 @@ async function planStake() {
     "Tier payment is never refunded on unstake; half burns and half enters the desk reserve.",
     ...(beneficiary !== wallet ? ["Beneficiary differs from depositor permanently: this wallet manages/unstakes the Punk, while the beneficiary owns reward claims."] : []),
   ];
-  const [baesApproval, punkApproval] = await Promise.all([
-    erc20Approval(ADDR.baes, ADDR.lockVault, tier.cost, wallet, `${formatUnits(tier.cost, 18)} BAES for ${tier.name} stake`),
-    nftApproval(ADDR.lockVault, tokenId, wallet, `Bario Punk #${tokenId} -> LockVault`),
-  ]);
+  // Prove current ownership before asking Bankr to acquire non-refundable tier BAES.
+  const punkApproval = await nftApproval(ADDR.lockVault, tokenId, wallet, `Bario Punk #${tokenId} -> LockVault`);
+  const resume = `node scripts/punktown.mjs plan-stake --wallet ${wallet} --token-id ${tokenId} --tier ${tierId} --beneficiary ${beneficiary} --acquisition-slippage-bps ${maxAcquisitionSlippageBps}`;
+  const acquisition = await baesAcquisitionPlan({
+    action: "stake",
+    wallet,
+    required: tier.cost,
+    maxSlippageBps: maxAcquisitionSlippageBps,
+    terms,
+    report,
+    warnings,
+    resume,
+  });
+  if (acquisition.emitted) return;
+  const baesApproval = await erc20Approval(ADDR.baes, ADDR.lockVault, tier.cost, wallet, `${formatUnits(tier.cost, 18)} BAES for ${tier.name} stake`);
   const nextApproval = [baesApproval.tx, punkApproval.tx].find(Boolean);
   if (nextApproval) {
     out(await approvalPlan({
       action: "stake",
       wallet,
       approvals: [nextApproval],
-      after: `node scripts/punktown.mjs plan-stake --wallet ${wallet} --token-id ${tokenId} --tier ${tierId} --beneficiary ${beneficiary}`,
+      after: resume,
       terms,
       report,
       warnings,
@@ -590,6 +983,7 @@ async function planUpgrade() {
   await deploymentGate();
   await routeGate("stock");
   const wallet = walletArg();
+  const maxAcquisitionSlippageBps = acquisitionSlippageBps();
   const positionId = integerArg("position-id", { min: 1n });
   const newTierId = Number(integerArg("new-tier", { min: 0n, max: 4n }));
   const position = await getPosition(positionId);
@@ -605,17 +999,35 @@ async function planUpgrade() {
     toTier: newTierId,
     baesDelta: delta,
     newWeight: newTier.weight,
+    funding: {
+      token: normalizeAddress(ADDR.baes),
+      requiredBaes: delta,
+      acquireIfShort: true,
+      maxSlippageBps: maxAcquisitionSlippageBps,
+    },
     approval: { token: normalizeAddress(ADDR.baes), spender: normalizeAddress(ADDR.lockVault), exactAmount: delta },
   };
   const report = `Upgrade Crew position ${positionId} from ${oldTier.name} to ${newTier.name} for ${formatUnits(delta, 18)} additional non-refundable BAES, using an exact LockVault approval if needed?`;
   const warnings = ["The old weight settles first; the new weight never earns past conversions. Upgrade BAES is non-refundable."];
+  const resume = `node scripts/punktown.mjs plan-upgrade --wallet ${wallet} --position-id ${positionId} --new-tier ${newTierId} --acquisition-slippage-bps ${maxAcquisitionSlippageBps}`;
+  const acquisition = await baesAcquisitionPlan({
+    action: "upgrade",
+    wallet,
+    required: delta,
+    maxSlippageBps: maxAcquisitionSlippageBps,
+    terms,
+    report,
+    warnings,
+    resume,
+  });
+  if (acquisition.emitted) return;
   const approval = await erc20Approval(ADDR.baes, ADDR.lockVault, delta, wallet, `${formatUnits(delta, 18)} BAES upgrade delta`);
   if (approval.tx) {
     out(await approvalPlan({
       action: "upgrade",
       wallet,
       approvals: [approval.tx],
-      after: `node scripts/punktown.mjs plan-upgrade --wallet ${wallet} --position-id ${positionId} --new-tier ${newTierId}`,
+      after: resume,
       terms,
       report,
       warnings,
@@ -1934,6 +2346,8 @@ const COMMANDS = {
   "plan-sync-donation": planSyncDonation,
   "plan-evict-head": planEvictHead,
   "plan-poke-bootstrap": planPokeBootstrap,
+  "bind-acquisition": bindAcquisition,
+  "verify-acquisition": verifyAcquisition,
   "inspect-calldata": inspectCalldata,
   "inspect-tx": inspectTx,
 };
@@ -1945,10 +2359,10 @@ const COMMAND_FLAGS = Object.freeze({
   punk: ["wallet", "token-id"],
   crew: ["wallet"],
   rewards: ["wallet"],
-  "plan-buy": ["wallet", "expected-token-id", "slippage-bps"],
+  "plan-buy": ["wallet", "expected-token-id", "slippage-bps", "acquisition-slippage-bps", "join"],
   "plan-sell": ["wallet", "token-id", "slippage-bps"],
-  "plan-stake": ["wallet", "token-id", "tier", "beneficiary"],
-  "plan-upgrade": ["wallet", "position-id", "new-tier"],
+  "plan-stake": ["wallet", "token-id", "tier", "beneficiary", "acquisition-slippage-bps"],
+  "plan-upgrade": ["wallet", "position-id", "new-tier", "acquisition-slippage-bps"],
   "plan-unstake": ["wallet", "position-id", "recipient"],
   "plan-settle": ["wallet", "position-id"],
   "plan-settle-all": ["wallet"],
@@ -1963,6 +2377,12 @@ const COMMAND_FLAGS = Object.freeze({
   "plan-sync-donation": ["wallet"],
   "plan-evict-head": ["wallet"],
   "plan-poke-bootstrap": ["wallet"],
+  "bind-acquisition": [
+    "wallet", "request-context", "request-key", "mode", "source-token", "source-symbol",
+    "source-decimals", "source-amount", "min-baes-out", "idempotency-key", "quote-id",
+    "fee-bps", "price-impact-bps", "swap-impact-bps", "max-price-impact-bps", "network-costs-usd",
+  ],
+  "verify-acquisition": ["wallet", "tx", "authorization-context", "authorization-key"],
   "inspect-calldata": ["wallet", "to", "data", "chain-id", "value", "context", "plan-key"],
   "inspect-tx": ["wallet", "tx", "context", "plan-key"],
 });

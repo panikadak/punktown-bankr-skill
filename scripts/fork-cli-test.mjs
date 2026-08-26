@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { selector } from "./lib/keccak256.mjs";
 
 const SKILL_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = resolve(SKILL_DIR, "scripts/punktown.mjs");
@@ -23,6 +24,8 @@ const FORK_WALLET = "0x702ba46435D1E55B18440100BC81EB055574875e";
 const BAES = "0xa9F6d9EcA1F803854A13CECad0f21d43e007DB07";
 const PUNKS = "0xDC1C20Df3F8EDeDF1466399C5d5D17d864bD3F0f";
 const WETH = "0x4200000000000000000000000000000000000006";
+const BANKR_NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const PUNK_AMM = "0x555c246d004D2F24b5BaDDd186Fc773eB6fb8445";
 const LOCK_VAULT = "0x69a60eae4Af0cAF965472f1268C723B1d60bcbE9";
 const STOCK_LOCK = "0x4570F784d35ab06a0FA22F42bb6329fAA998a6BA";
@@ -31,6 +34,7 @@ const ALT_RECIPIENT = "0x000000000000000000000000000000000000cafE";
 const ERC8021_MARKER = "80218021802180218021802180218021";
 const archiveRpc = process.env.BASE_RPC_URL;
 const baseAnvilBin = process.env.BASE_ANVIL_BIN || "base-anvil";
+const baseForgeBin = process.env.BASE_FORGE_BIN || "base-forge";
 
 let localRpc = null;
 let anvil = null;
@@ -189,6 +193,7 @@ async function startFork() {
     "--fork-block-number", String(FORK_BLOCK),
     "--chain-id", String(CHAIN_ID),
     "--auto-impersonate",
+    "--no-storage-caching",
     "--host", "127.0.0.1",
     "--port", String(port),
     "--quiet",
@@ -220,6 +225,33 @@ async function stopFork() {
     child.kill("SIGKILL");
     await Promise.race([once(child, "exit"), delay(2_000)]);
   }
+}
+
+async function compileSwapReceiptFixture() {
+  const result = await runProcess(baseForgeBin, ["inspect", "BankrSwapReceiptFixture", "bytecode"], {
+    cwd: SKILL_DIR,
+    env: process.env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.code !== 0) {
+    throw new Error(`failed to compile BankrSwapReceiptFixture: ${redact(result.stderr || result.stdout)}`);
+  }
+  const bytecode = result.stdout.match(/0x[0-9a-fA-F]+/g)?.at(-1);
+  if (!bytecode || bytecode.length < 4) throw new Error("base-forge emitted no fixture bytecode");
+  return bytecode;
+}
+
+async function deploySwapReceiptFixture(bytecode) {
+  const hash = await rpc("eth_sendTransaction", [{
+    from: FORK_WALLET,
+    data: bytecode,
+    value: "0x0",
+    gas: "0x989680",
+  }]);
+  const receipt = await waitForReceipt(hash);
+  assert("swap receipt fixture deployed", BigInt(receipt.status) === 1n && Boolean(receipt.contractAddress), receipt);
+  return normalizeAddress(receipt.contractAddress);
 }
 
 function runProcess(executable, args, options) {
@@ -443,12 +475,16 @@ async function settlePositions(wallet, positionIds, label) {
   return results;
 }
 
-async function buyPunk(wallet, label) {
-  const args = ["plan-buy", "--wallet", wallet, "--slippage-bps", "300"];
+async function buyPunk(wallet, label, { join = false } = {}) {
+  const args = ["plan-buy", "--wallet", wallet, "--slippage-bps", "300", ...(join ? ["--join"] : [])];
   const initial = await expectCliSuccess(`${label} initial plan`, args);
   const tokenId = initial.terms.tokenId;
   const flow = await executePlannerFlow(label, args, initial);
   assert(`${label} ownership`, await ownerOf(tokenId) === normalizeAddress(wallet), { tokenId });
+  if (join) {
+    assert(`${label} asks for Crew tier only after buy`, flow.plan.afterSuccess?.action === "ask-crew-tier", flow.plan.afterSuccess);
+    assert(`${label} exposes all five tier choices`, flow.plan.afterSuccess?.choices?.length === 5, flow.plan.afterSuccess?.choices);
+  }
   return { tokenId, ...flow };
 }
 
@@ -480,19 +516,223 @@ async function runComprehensiveFlows(boughtTokenId, pendingPlan, pendingHash) {
   await rpc("anvil_impersonateAccount", [ALT_RECIPIENT]);
   assert("isolated E2E wallet is code-free", await rpc("eth_getCode", [MUTATION_RECIPIENT, "latest"]) === "0x");
 
-  const baesFunding = rawAmount("50000000");
-  await mineRaw({
-    from: FORK_WALLET,
-    to: BAES,
-    data: encodeErc20Transfer(MUTATION_RECIPIENT, baesFunding),
-  }, "isolated wallet BAES funding");
+  const joinArgs = [
+    "plan-buy", "--wallet", MUTATION_RECIPIENT, "--slippage-bps", "300",
+    "--acquisition-slippage-bps", "300", "--join",
+  ];
+  const unfundedJoin = await expectCliSuccess("unfunded natural join plan", joinArgs);
+  assert("unfunded join enters Bankr BAES acquisition", unfundedJoin.phase === "acquire-baes", unfundedJoin.phase);
+  assert("acquisition emits no raw transaction", Array.isArray(unfundedJoin.txs) && unfundedJoin.txs.length === 0, unfundedJoin.txs);
+  assert(
+    "acquisition binds the pinned BAES output",
+    unfundedJoin.acquisition?.operation === "bankr-native-same-chain-exact-output"
+      && normalizeAddress(unfundedJoin.acquisition.outputToken.address) === normalizeAddress(BAES)
+      && BigInt(unfundedJoin.acquisition.requestedOutput) === rawAmount("6600000"),
+    unfundedJoin.acquisition,
+  );
+  assert("natural join emits a distinct acquisition request binding", /^0x[0-9a-f]{64}$/.test(unfundedJoin.acquisitionRequestKey), unfundedJoin.acquisitionRequestKey);
+  assert("natural join emits canonical acquisition request context", /^0x(?:[0-9a-f]{2})+$/.test(unfundedJoin.acquisitionRequestContextHex), unfundedJoin.acquisitionRequestContextHex);
+  const acquisitionBindArgs = [
+    "bind-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--request-context", unfundedJoin.acquisitionRequestContextHex,
+    "--request-key", unfundedJoin.acquisitionRequestKey,
+    "--mode", "wallet-api-exact-input",
+    "--source-token", WETH, "--source-symbol", "WETH", "--source-decimals", "18",
+    "--source-amount", "0.01", "--min-baes-out", "6600000",
+    "--idempotency-key", "123e4567-e89b-42d3-a456-426614174000",
+    "--quote-id", "fork-quote-1", "--fee-bps", "100", "--price-impact-bps", "7",
+    "--swap-impact-bps", "5", "--max-price-impact-bps", "500", "--network-costs-usd", "0.01",
+  ];
+  const boundAcquisition = await expectCliSuccess("structured Bankr fallback quote binding", acquisitionBindArgs);
+  assert("fallback quote reaches acquisition authorization", boundAcquisition.phase === "acquisition-authorization", boundAcquisition.phase);
+  assert("authorization binds exact source token", normalizeAddress(boundAcquisition.execution.request.fromToken) === normalizeAddress(WETH), boundAcquisition.execution);
+  assert("authorization binds BAES minBuyAmount", boundAcquisition.execution.request.minBuyAmount === "6600000", boundAcquisition.execution);
+  assert(
+    "Wallet API request emits numeric slippageBps",
+    typeof boundAcquisition.execution.request.slippageBps === "number"
+      && boundAcquisition.execution.request.slippageBps === 300,
+    boundAcquisition.execution.request,
+  );
+  assert(
+    "fallback confirmation names the canonical source address",
+    boundAcquisition.report.includes(`WETH (${normalizeAddress(WETH)})`),
+    boundAcquisition.report,
+  );
+  assert("authorization emits a distinct confirmation key", /^0x[0-9a-f]{64}$/.test(boundAcquisition.acquisitionAuthorizationKey), boundAcquisition.acquisitionAuthorizationKey);
+  assert("authorization emits canonical verification context", /^0x(?:[0-9a-f]{2})+$/.test(boundAcquisition.authorizationContextHex), boundAcquisition.authorizationContextHex);
+  const nativeAcquisition = await expectCliSuccess("Bankr native exact-output preview binding", [
+    "bind-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--request-context", unfundedJoin.acquisitionRequestContextHex,
+    "--request-key", unfundedJoin.acquisitionRequestKey,
+    "--mode", "bankr-native-exact-output",
+    "--source-token", BANKR_NATIVE_TOKEN, "--source-symbol", "ETH", "--source-decimals", "18",
+    "--source-amount", "0.011", "--min-baes-out", "6600000",
+    "--quote-id", "fork-native-quote-1", "--fee-bps", "100", "--price-impact-bps", "7",
+  ]);
+  assert("native authorization binds maximum source spend", nativeAcquisition.authorizationTerms.quote.sourceAmountMode === "maximum-input", nativeAcquisition.authorizationTerms.quote);
+  assert("native authorization binds exact BAES intent", nativeAcquisition.execution.intent.exactOutput === "6600000", nativeAcquisition.execution);
+  assert(
+    "native Bankr intent emits numeric slippageBps",
+    typeof nativeAcquisition.execution.intent.slippageBps === "number"
+      && nativeAcquisition.execution.intent.slippageBps === 300,
+    nativeAcquisition.execution.intent,
+  );
+  assert(
+    "native confirmation names the canonical source address",
+    nativeAcquisition.report.includes(`ETH (${normalizeAddress(BANKR_NATIVE_TOKEN)})`),
+    nativeAcquisition.report,
+  );
+  assert("native authorization canonicalizes Bankr ETH sentinel", nativeAcquisition.authorizationTerms.quote.sourceToken === normalizeAddress(BANKR_NATIVE_TOKEN), nativeAcquisition.authorizationTerms.quote);
+  const zeroNativeAcquisition = await expectCliSuccess("zero-address native ETH preview binding", [
+    "bind-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--request-context", unfundedJoin.acquisitionRequestContextHex,
+    "--request-key", unfundedJoin.acquisitionRequestKey,
+    "--mode", "bankr-native-exact-output",
+    "--source-token", ZERO_ADDRESS, "--source-symbol", "ETH", "--source-decimals", "18",
+    "--source-amount", "0.011", "--min-baes-out", "6600000",
+    "--quote-id", "fork-native-quote-1", "--fee-bps", "100", "--price-impact-bps", "7",
+  ]);
+  assert("Bankr ETH sentinel and zero address bind identically", zeroNativeAcquisition.acquisitionAuthorizationKey === nativeAcquisition.acquisitionAuthorizationKey, {
+    sentinel: nativeAcquisition.acquisitionAuthorizationKey,
+    zero: zeroNativeAcquisition.acquisitionAuthorizationKey,
+  });
+  await expectCliFailure("native exact-output preview cannot raise the receipt floor", [
+    "bind-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--request-context", unfundedJoin.acquisitionRequestContextHex,
+    "--request-key", unfundedJoin.acquisitionRequestKey,
+    "--mode", "bankr-native-exact-output",
+    "--source-token", BANKR_NATIVE_TOKEN, "--source-symbol", "ETH", "--source-decimals", "18",
+    "--source-amount", "0.011", "--min-baes-out", "6600001",
+  ], "acquisition-quote");
+  assert("native and fallback economics have different keys", nativeAcquisition.acquisitionAuthorizationKey !== boundAcquisition.acquisitionAuthorizationKey, {
+    native: nativeAcquisition.acquisitionAuthorizationKey,
+    fallback: boundAcquisition.acquisitionAuthorizationKey,
+  });
+  await expectCliFailure(
+    "fallback quote below the BAES deficit",
+    acquisitionBindArgs.map((value, index, values) => values[index - 1] === "--min-baes-out" ? "6599999" : value),
+    "acquisition-quote",
+  );
+  const joinConfirmationKey = unfundedJoin.confirmationKey;
+  const joinTokenId = unfundedJoin.terms.tokenId;
+
   await mineRaw({
     from: MUTATION_RECIPIENT,
     to: WETH,
     data: "0xd0e30db0",
     value: rawAmount("0.2"),
   }, "isolated wallet WETH wrapping");
-
+  const swapFixture = await deploySwapReceiptFixture(await compileSwapReceiptFixture());
+  await mineRaw({
+    from: FORK_WALLET,
+    to: BAES,
+    data: encodeErc20Transfer(swapFixture, rawAmount("33000000")),
+  }, "swap receipt fixture BAES funding");
+  await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: WETH,
+    data: encodeErc20Approve(swapFixture, rawAmount("0.01")),
+  }, "swap receipt fixture WETH approval");
+  const fixtureSwapData = `${selector("swap(address,address,uint256,uint256)").slice(2)}`
+    + `${wordAddress(WETH)}${wordAddress(BAES)}${wordUint(rawAmount("0.01"))}${wordUint(rawAmount("6600000"))}`;
+  const acquisitionResult = await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: swapFixture,
+    data: `0x${fixtureSwapData}`,
+  }, "Bankr-managed swap receipt fixture");
+  const verifiedAcquisition = await expectCliSuccess("Bankr acquisition receipt verification", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", acquisitionResult.hash,
+    "--authorization-context", boundAcquisition.authorizationContextHex,
+    "--authorization-key", boundAcquisition.acquisitionAuthorizationKey,
+  ]);
+  assert("acquisition proof binds exact WETH debit", BigInt(verifiedAcquisition.sourceAmountObserved) === rawAmount("0.01"), verifiedAcquisition);
+  assert("acquisition proof labels ERC-20 debit", verifiedAcquisition.sourceObservation === "erc20-transfer-debit", verifiedAcquisition);
+  assert("acquisition proof binds minimum BAES receipt", BigInt(verifiedAcquisition.baesReceived) === rawAmount("6600000"), verifiedAcquisition);
+  const nativeFixtureSwapData = `${selector("swapNative(address,uint256)").slice(2)}`
+    + `${wordAddress(BAES)}${wordUint(rawAmount("6600000"))}`;
+  const nativeAcquisitionResult = await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: swapFixture,
+    data: `0x${nativeFixtureSwapData}`,
+    value: rawAmount("0.011"),
+  }, "Bankr native ETH swap receipt fixture");
+  const verifiedNativeAcquisition = await expectCliSuccess("Bankr native ETH acquisition receipt verification", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", nativeAcquisitionResult.hash,
+    "--authorization-context", nativeAcquisition.authorizationContextHex,
+    "--authorization-key", nativeAcquisition.acquisitionAuthorizationKey,
+  ]);
+  assert("native acquisition proof measures transaction value", BigInt(verifiedNativeAcquisition.sourceAmountObserved) === rawAmount("0.011"), verifiedNativeAcquisition);
+  assert("native acquisition proof labels value sent", verifiedNativeAcquisition.sourceObservation === "native-transaction-value-sent", verifiedNativeAcquisition);
+  assert("native acquisition proof binds minimum BAES receipt", BigInt(verifiedNativeAcquisition.baesReceived) === rawAmount("6600000"), verifiedNativeAcquisition);
+  const overLimitNativeResult = await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: swapFixture,
+    data: `0x${nativeFixtureSwapData}`,
+    value: rawAmount("0.012"),
+  }, "over-limit native ETH acquisition fixture");
+  await expectCliFailure("native acquisition rejects value above confirmed maximum", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", overLimitNativeResult.hash,
+    "--authorization-context", nativeAcquisition.authorizationContextHex,
+    "--authorization-key", nativeAcquisition.acquisitionAuthorizationKey,
+  ], "acquisition-receipt");
+  const wrongSignerNativeResult = await mineRaw({
+    from: ALT_RECIPIENT,
+    to: swapFixture,
+    data: `0x${nativeFixtureSwapData}`,
+    value: rawAmount("0.001"),
+  }, "wrong-signer native ETH acquisition fixture");
+  await expectCliFailure("native acquisition rejects a different signer", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", wrongSignerNativeResult.hash,
+    "--authorization-context", nativeAcquisition.authorizationContextHex,
+    "--authorization-key", nativeAcquisition.acquisitionAuthorizationKey,
+  ], "acquisition-receipt");
+  const zeroValueData = `${selector("deliverOutput(address,uint256)").slice(2)}`
+    + `${wordAddress(BAES)}${wordUint(rawAmount("6600000"))}`;
+  const zeroValueNativeResult = await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: swapFixture,
+    data: `0x${zeroValueData}`,
+  }, "zero-value native acquisition fixture");
+  await expectCliFailure("native acquisition rejects zero transaction value", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", zeroValueNativeResult.hash,
+    "--authorization-context", nativeAcquisition.authorizationContextHex,
+    "--authorization-key", nativeAcquisition.acquisitionAuthorizationKey,
+  ], "acquisition-receipt");
+  const revertedNativeHash = await rpc("eth_sendTransaction", [{
+    from: MUTATION_RECIPIENT,
+    to: swapFixture,
+    data: `0x${nativeFixtureSwapData}`,
+    value: hexQuantity(rawAmount("0.001")),
+    gas: "0x989680",
+  }]);
+  const revertedNativeReceipt = await waitForReceipt(revertedNativeHash);
+  assert("reverted native acquisition fixture has failed receipt", BigInt(revertedNativeReceipt.status) === 0n, revertedNativeReceipt.status);
+  await expectCliFailure("native acquisition rejects a reverted receipt", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", revertedNativeHash,
+    "--authorization-context", nativeAcquisition.authorizationContextHex,
+    "--authorization-key", nativeAcquisition.acquisitionAuthorizationKey,
+  ], "acquisition-receipt");
+  const fundedJoin = await expectCliSuccess("funded natural join re-plan", [
+    ...joinArgs,
+    "--expected-token-id", String(joinTokenId),
+  ]);
+  assert("funded join advances to exact approval", fundedJoin.phase === "approval", fundedJoin.phase);
+  assert("acquisition preserves final buy confirmation terms", fundedJoin.confirmationKey === joinConfirmationKey, {
+    before: joinConfirmationKey,
+    after: fundedJoin.confirmationKey,
+  });
+  assert("join intent remains bound after acquisition", fundedJoin.terms.joinCrew === true, fundedJoin.terms);
+  await mineRaw({
+    from: FORK_WALLET,
+    to: BAES,
+    data: encodeErc20Transfer(MUTATION_RECIPIENT, rawAmount("43400000")),
+  }, "subsequent workflow BAES fixture funding");
   const sell = await executePlannerFlow("sell", [
     "plan-sell", "--wallet", MUTATION_RECIPIENT,
     "--token-id", String(boughtTokenId), "--slippage-bps", "300",
@@ -500,20 +740,92 @@ async function runComprehensiveFlows(boughtTokenId, pendingPlan, pendingHash) {
   assert("sell used token-specific approval", sell.approvalCount === 1, sell.approvalCount);
   assert("sold punk returned to desk", await ownerOf(boughtTokenId) === normalizeAddress(PUNK_AMM));
 
-  const firstBuy = await buyPunk(MUTATION_RECIPIENT, "first isolated buy");
+  const firstBuy = await buyPunk(MUTATION_RECIPIENT, "first isolated buy", { join: true });
   const secondBuy = await buyPunk(MUTATION_RECIPIENT, "second isolated buy");
-  const firstStake = await stakePunk(MUTATION_RECIPIENT, firstBuy.tokenId, "first stake");
+
+  const preStakeBalance = await tokenBalance(BAES, MUTATION_RECIPIENT);
+  await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: BAES,
+    data: encodeErc20Transfer(FORK_WALLET, preStakeBalance),
+  }, "stake acquisition shortfall setup");
+  const firstStakeArgs = [
+    "plan-stake", "--wallet", MUTATION_RECIPIENT,
+    "--token-id", String(firstBuy.tokenId), "--tier", "0",
+  ];
+  await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: PUNKS,
+    data: encodePunkTransfer(MUTATION_RECIPIENT, ALT_RECIPIENT, firstBuy.tokenId),
+  }, "stake ownership pre-acquisition gate setup");
+  await expectCliFailure("unowned Punk never requests tier BAES", firstStakeArgs, "ownership");
+  await mineRaw({
+    from: ALT_RECIPIENT,
+    to: PUNKS,
+    data: encodePunkTransfer(ALT_RECIPIENT, MUTATION_RECIPIENT, firstBuy.tokenId),
+  }, "stake ownership pre-acquisition gate restore");
+  const unfundedStake = await expectCliSuccess("unfunded Crew stake plan", firstStakeArgs);
+  assert("unfunded stake enters Bankr BAES acquisition", unfundedStake.phase === "acquire-baes", unfundedStake.phase);
+  assert("Signal acquisition targets the exact tier deficit", BigInt(unfundedStake.acquisition.requestedOutput) === rawAmount("600000"), unfundedStake.acquisition);
+  await mineRaw({
+    from: FORK_WALLET,
+    to: BAES,
+    data: encodeErc20Transfer(MUTATION_RECIPIENT, rawAmount("600000")),
+  }, "stake acquisition completion setup");
+  const fundedStake = await expectCliSuccess("funded Crew stake re-plan", firstStakeArgs);
+  assert("funded stake advances to approval", fundedStake.phase === "approval", fundedStake.phase);
+  assert("stake acquisition preserves tier confirmation terms", fundedStake.confirmationKey === unfundedStake.confirmationKey, {
+    before: unfundedStake.confirmationKey,
+    after: fundedStake.confirmationKey,
+  });
+  const firstStakeFlow = await executePlannerFlow("first stake", firstStakeArgs, fundedStake);
+  const firstStake = {
+    position: await positionFromOpened(firstStakeFlow, firstBuy.tokenId, MUTATION_RECIPIENT, "first stake"),
+    ...firstStakeFlow,
+  };
+
+  await mineRaw({
+    from: FORK_WALLET,
+    to: BAES,
+    data: encodeErc20Transfer(MUTATION_RECIPIENT, rawAmount("20000000")),
+  }, "remaining workflow BAES funding");
   const secondStake = await stakePunk(MUTATION_RECIPIENT, secondBuy.tokenId, "second stake");
   assert("first stake used exact BAES then token approval", firstStake.approvalCount === 2, firstStake.approvalCount);
   assert("second stake used exact BAES then token approval", secondStake.approvalCount === 2, secondStake.approvalCount);
 
   const firstPositionId = firstStake.position.id;
   const secondPositionId = secondStake.position.id;
-  const upgrade = await executePlannerFlow("upgrade", [
+  const preUpgradeBalance = await tokenBalance(BAES, MUTATION_RECIPIENT);
+  await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: BAES,
+    data: encodeErc20Transfer(FORK_WALLET, preUpgradeBalance),
+  }, "upgrade acquisition shortfall setup");
+  const upgradeArgs = [
     "plan-upgrade", "--wallet", MUTATION_RECIPIENT,
     "--position-id", String(firstPositionId), "--new-tier", "1",
-  ]);
+  ];
+  const unfundedUpgrade = await expectCliSuccess("unfunded Crew upgrade plan", upgradeArgs);
+  assert("unfunded upgrade enters Bankr BAES acquisition", unfundedUpgrade.phase === "acquire-baes", unfundedUpgrade.phase);
+  assert("upgrade acquisition targets exact tier delta", BigInt(unfundedUpgrade.acquisition.requestedOutput) === rawAmount("900000"), unfundedUpgrade.acquisition);
+  await mineRaw({
+    from: FORK_WALLET,
+    to: BAES,
+    data: encodeErc20Transfer(MUTATION_RECIPIENT, rawAmount("900000")),
+  }, "upgrade acquisition completion setup");
+  const fundedUpgrade = await expectCliSuccess("funded Crew upgrade re-plan", upgradeArgs);
+  assert("upgrade acquisition preserves confirmation terms", fundedUpgrade.confirmationKey === unfundedUpgrade.confirmationKey, {
+    before: unfundedUpgrade.confirmationKey,
+    after: fundedUpgrade.confirmationKey,
+  });
+  const upgrade = await executePlannerFlow("upgrade", upgradeArgs, fundedUpgrade);
   assert("upgrade used one exact BAES approval", upgrade.approvalCount === 1, upgrade.approvalCount);
+
+  await mineRaw({
+    from: FORK_WALLET,
+    to: BAES,
+    data: encodeErc20Transfer(MUTATION_RECIPIENT, rawAmount("20000000")),
+  }, "post-upgrade workflow BAES funding");
 
   await mineRaw({
     from: MUTATION_RECIPIENT,
@@ -661,6 +973,11 @@ async function ownerOf(tokenId, block = "latest") {
   const data = `0x6352211e${wordUint(tokenId)}`;
   const encoded = await rpc("eth_call", [{ to: PUNKS, data }, block]);
   return normalizeAddress(`0x${encoded.slice(-40)}`);
+}
+
+async function tokenBalance(token, account, block = "latest") {
+  const data = `0x70a08231${wordAddress(account)}`;
+  return BigInt(await rpc("eth_call", [{ to: token, data }, block]));
 }
 
 async function mutateBoughtPunkOwner(tokenId) {

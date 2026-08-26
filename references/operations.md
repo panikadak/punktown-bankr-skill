@@ -76,15 +76,20 @@ see “ERC721-C and wallet receivers” below.
 
 ## Shared write workflow
 
-Every `plan-*` command runs the reviewed deployment and selector gates, reads
-fresh state, simulates the call, and emits at most one unsigned transaction.
+Every `plan-*` command runs the reviewed deployment and relevant state gates,
+reads fresh state, and emits at most one unsigned transaction. A buy, stake, or
+upgrade with insufficient BAES instead emits `phase: acquire-baes` and no raw
+transaction; action simulation follows only after the wallet is funded and the
+planner is rerun.
 
 1. Resolve and pass the authenticated Bankr EVM signer as `--wallet`.
 2. Run the relevant read command so the user sees the current NFT, position,
    credit, route, and capacity state.
 3. Run the planner. On `ok: false`, stop and relay `detail`; do not improvise.
-4. Present one confirmation for the whole unchanged operation. Include every
-   approval and final call expected, even though they will be planned in phases.
+4. If the planner requests BAES, follow `natural-join-flow.md`: obtain a concrete
+   Bankr preview, bind the source and maximum spend, and include the swap plus
+   every later approval/final call in one confirmation. Otherwise present one
+   confirmation for the whole unchanged operation.
 5. Decode the emitted transaction again with `inspect-calldata` immediately
    before Bankr submission.
 6. Submit one transaction with confirmation waiting enabled. Require a mined
@@ -174,6 +179,7 @@ or disabled tokens can retain valid pending amounts and credits.
 
 ```bash
 node scripts/punktown.mjs plan-buy --wallet 0x… [--slippage-bps 300]
+node scripts/punktown.mjs plan-buy --wallet 0x… --join [--slippage-bps 300]
 ```
 
 Preconditions and plan:
@@ -181,8 +187,10 @@ Preconditions and plan:
 - fee route active and unpaused;
 - nonempty inventory and a fresh `fifoHead`;
 - desk still owns the head;
-- wallet can receive the Bario Punk;
-- wallet has at least 6,600,000 BAES;
+- wallet bytecode is checked before acquisition; a contract wallet's current
+  receiver compatibility is proven later by the funded action simulation;
+- if the wallet has less than 6,600,000 BAES, the planner emits an acquisition
+  request for exactly the current deficit and no Punk Town transaction;
 - BAES allowance to PunkAMM is exactly 6,600,000 BAES;
 - fresh fee quote, nonzero `minWethOut`, latest-Base-block deadline;
 - call fixes `expectedHeadTokenId` to the fresh head and `maxBAESIn` to exactly
@@ -191,6 +199,9 @@ Preconditions and plan:
 If allowance is not exact, the planner emits only `BAES.approve(PunkAMM,
 6,600,000 BAES)`. After it mines, rerun; the FIFO head or quote may have
 changed. Do not ask the user to select a different desk NFT: buying is FIFO.
+
+With `--join`, the same final plan carries a post-success tier handoff. Do not
+ask for or fund a tier until `NFTBought` and fresh wallet ownership are proven.
 
 Expected completion: successful `NFTBought` for the signer and head token,
 wallet `ownerOf(tokenId)`, inventory reduced by one, tracked reserve increased
@@ -267,13 +278,18 @@ node scripts/punktown.mjs plan-stake \
 
 Preconditions and plan:
 
-- wallet owns the punk;
+- wallet owns the punk; this is proven before any tier BAES acquisition request;
 - stock route unpaused and system open;
 - active position count below 3,333;
 - valid tier and nonzero beneficiary;
 - exact BAES allowance to LockVault for that tier's cost;
 - token-specific Bario Punk approval to LockVault;
 - current ERC721-C transfer and receiver simulation succeeds.
+
+If the wallet lacks the chosen tier cost, the planner requests only that live
+BAES shortfall after ownership and capacity gates pass. Follow the Bankr
+acquisition flow, rerun the exact command, and obtain a new confirmation because
+the tier is a separate non-refundable decision from buying the Punk.
 
 The planner emits only one missing approval at a time and must be rerun after
 each mined approval. The confirmation names the full non-refundable BAES cost,
@@ -294,7 +310,8 @@ Only the active position's depositor may upgrade, and only to a higher tier.
 The exact BAES cost is `tierCost(new) - tierCost(old)`. StockLock settles all
 lifetime tokens at the old weight before the new weight takes effect, so an
 upgrade cannot earn past distributions retroactively. The stock route must be
-unpaused.
+unpaused. If the depositor lacks the delta, acquire only that shortfall through
+the same concretely quoted and confirmed Bankr flow before any approval.
 
 Expected completion: any earned `CreditWritten` events at old weight,
 `PositionUpgraded`, exact BAES delta/split, and the new tier, weight, and total

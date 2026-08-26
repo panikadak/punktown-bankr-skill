@@ -27,6 +27,8 @@ import {
 } from "./lib/protocol.mjs";
 
 const allowlist = JSON.parse(readFileSync(new URL("../references/signing-allowlist.json", import.meta.url), "utf8"));
+const catalog = JSON.parse(readFileSync(new URL("../catalog.json", import.meta.url), "utf8"));
+const skillMarkdown = readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
 const results = [];
 
 function check(name, pass, detail = "") {
@@ -179,9 +181,23 @@ for (const forbidden of [
   check(`privileged call excluded: ${forbidden}`, !userWriteSignatures.includes(forbidden));
 }
 
+// Bankr's public skill format: frontmatter identity/discovery fields plus the
+// standalone catalog/install linkage must stay internally consistent.
+const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ?? "";
+equal("Bankr frontmatter name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "punktown");
+check("Bankr frontmatter description", /^description:\s*\S.+$/m.test(frontmatter));
+check("Bankr frontmatter tags", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
+equal("Bankr frontmatter version", frontmatter.match(/^version:\s*(\d+)$/m)?.[1], "2");
+equal("Bankr frontmatter visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
+equal("catalog slug matches skill name", catalog.slug, "punktown");
+equal("catalog schema version", catalog.schemaVersion, 1);
+check("catalog installs public standalone repo", catalog.install?.type === "bankr"
+  && catalog.install?.repoPath === "."
+  && catalog.install?.command === "install the skill at https://github.com/panikadak/punktown-bankr-skill");
+
 // Bankr loads these files; keep each below its 100 KB limit.
 for (const relative of [
-  "SKILL.md", "references/operations.md", "references/bankr-execution.md",
+  "SKILL.md", "references/operations.md", "references/bankr-execution.md", "references/natural-join-flow.md",
   "references/deployment.json", "references/signing-allowlist.json",
 ]) {
   try {

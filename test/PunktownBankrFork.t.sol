@@ -11,6 +11,7 @@ interface Vm {
 
 interface IERC20 {
     function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
     function allowance(address owner, address spender) external view returns (uint256);
@@ -96,6 +97,24 @@ contract BankrSmartWalletHarness {
     }
 
     receive() external payable {}
+}
+
+// Test-only swap envelope used by the CLI fork harness to prove that acquisition
+// verification measures receipt transfers without trusting a router or calldata.
+contract BankrSwapReceiptFixture {
+    function swap(address source, address output, uint256 sourceAmount, uint256 outputAmount) external {
+        require(IERC20(source).transferFrom(msg.sender, address(this), sourceAmount), "source transfer");
+        require(IERC20(output).transfer(msg.sender, outputAmount), "output transfer");
+    }
+
+    function swapNative(address output, uint256 outputAmount) external payable {
+        require(msg.value > 0, "native value");
+        require(IERC20(output).transfer(msg.sender, outputAmount), "output transfer");
+    }
+
+    function deliverOutput(address output, uint256 outputAmount) external {
+        require(IERC20(output).transfer(msg.sender, outputAmount), "output transfer");
+    }
 }
 
 contract PunktownBankrForkTest {
