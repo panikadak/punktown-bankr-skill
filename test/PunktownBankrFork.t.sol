@@ -115,6 +115,11 @@ contract BankrSwapReceiptFixture {
     function deliverOutput(address output, uint256 outputAmount) external {
         require(IERC20(output).transfer(msg.sender, outputAmount), "output transfer");
     }
+
+    function fakeSwapSelf(address source, address output, uint256 sourceAmount, uint256 outputAmount) external {
+        require(IERC20(source).transferFrom(msg.sender, msg.sender, sourceAmount), "source self transfer");
+        require(IERC20(output).transferFrom(msg.sender, msg.sender, outputAmount), "output self transfer");
+    }
 }
 
 contract PunktownBankrForkTest {

@@ -1,7 +1,11 @@
 import { keccak256 } from "./keccak256.mjs";
 import { strip0x } from "./abi.mjs";
 
-const PUBLIC_RPCS = ["https://base-rpc.publicnode.com", "https://mainnet.base.org"];
+const PUBLIC_RPCS = [
+  "https://base-mainnet.public.blastapi.io",
+  "https://base-rpc.publicnode.com",
+  "https://mainnet.base.org",
+];
 const configuredRpc = process.env.PUNKTOWN_RPC_URL || process.env.BASE_RPC_URL;
 // An explicit endpoint may be a local fork or private snapshot. Never fall
 // through from it to public mainnet. Without an override, choose the first
@@ -14,6 +18,7 @@ const RPC_TIMEOUT_MS = Number.isSafeInteger(configuredTimeout) && configuredTime
   : 30_000;
 let pinnedRpcIndex = null;
 let requestId = 1;
+const TRANSIENT_HTTP = new Set([429, 502, 503, 504]);
 
 export class RpcError extends Error {
   constructor(message, data = null, code = null) {
@@ -30,35 +35,48 @@ function timeoutSignal(milliseconds) {
   return { signal: controller.signal, clear: () => clearTimeout(timer) };
 }
 
+function retryDelay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 export async function rpc(method, params = []) {
   let lastError = new Error("no RPC endpoint attempted");
   const candidates = pinnedRpcIndex === null ? RPCS.map((_, index) => index) : [pinnedRpcIndex];
   for (const index of candidates) {
-    const { signal, clear } = timeoutSignal(RPC_TIMEOUT_MS);
-    try {
-      const response = await fetch(RPCS[index], {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: requestId++, method, params }),
-        signal,
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const body = await response.json();
-      if (body.error) {
-        throw new RpcError(
-          `RPC ${body.error.code ?? "error"}: ${body.error.message ?? "unknown error"}`,
-          body.error.data ?? null,
-          body.error.code ?? null,
-        );
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const { signal, clear } = timeoutSignal(RPC_TIMEOUT_MS);
+      try {
+        const response = await fetch(RPCS[index], {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: requestId++, method, params }),
+          signal,
+        });
+        if (!response.ok) {
+          if (TRANSIENT_HTTP.has(response.status) && attempt < 3) {
+            await retryDelay(500 * 2 ** attempt);
+            continue;
+          }
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const body = await response.json();
+        if (body.error) {
+          throw new RpcError(
+            `RPC ${body.error.code ?? "error"}: ${body.error.message ?? "unknown error"}`,
+            body.error.data ?? null,
+            body.error.code ?? null,
+          );
+        }
+        pinnedRpcIndex = index;
+        return body.result;
+      } catch (error) {
+        lastError = error;
+        // A deterministic eth_call revert should not be hidden by another provider.
+        if (error instanceof RpcError && error.data) throw error;
+        break;
+      } finally {
+        clear();
       }
-      pinnedRpcIndex = index;
-      return body.result;
-    } catch (error) {
-      lastError = error;
-      // A deterministic eth_call revert should not be hidden by another provider.
-      if (error instanceof RpcError && error.data) throw error;
-    } finally {
-      clear();
     }
   }
   const scope = pinnedRpcIndex === null && RPCS.length > 1 ? "all public Base RPCs" : "the pinned Base RPC";
@@ -103,6 +121,18 @@ export async function getReceipt(transactionHash) {
 
 export async function getTransaction(transactionHash) {
   return await rpc("eth_getTransactionByHash", [transactionHash]);
+}
+
+export async function getBlockByHash(blockHash, fullTransactions = false) {
+  return await rpc("eth_getBlockByHash", [blockHash, fullTransactions]);
+}
+
+export async function getTransactionCount(address, block = "latest") {
+  return BigInt(await rpc("eth_getTransactionCount", [address, block]));
+}
+
+export async function getStorageAt(address, slot, block = "latest") {
+  return await rpc("eth_getStorageAt", [address, slot, block]);
 }
 
 export function unsignedTx(to, data, label, extra = {}) {

@@ -17,7 +17,9 @@ EVM chains, but Punk Town actions are always Base `chainId: 8453`.
 - Never print, persist, or pass a Bankr API key in a command-line argument.
 
 Pass the resolved wallet to every script command as `--wallet 0x…`. Require the
-signer returned by Bankr submission to equal that same address.
+logical signer returned by Bankr submission to equal that same address. Do not
+compare a sponsored transaction's outer `transaction.from` to the wallet: that
+field is the bundler/relayer. `inspect-tx` proves the inner wallet execution.
 
 ## 2. Bankr access requirements
 
@@ -49,6 +51,46 @@ Bankr credentials are secrets. Use the authenticated runtime or environment;
 do not embed headers, keys, cookies, or tokens in a skill file, plan output,
 shell history, log, issue, or chat response.
 
+### Supported Base execution envelopes
+
+`references/bankr-execution.json` pins the only accepted forms:
+
+- a direct transaction whose outer sender is the active wallet; or
+- Bankr's current gas-sponsored EntryPoint v0.7 transaction containing exactly
+  one UserOperation for the active EIP-7702/Kernel wallet.
+
+The outer EntryPoint bundle may include unrelated users. The verifier selects
+the unique operation whose `sender` is the active wallet, requires Kernel
+`execute(bytes32,bytes)` in all-zero single/default fail-on-error mode, and
+recovers its logical target, value, and calldata. The UserOperation must use
+Kernel's native EIP-7702 validation mode/type `0x00/0x00`, empty `initCode`,
+and empty `paymasterAndData`; its root validator must be zero at the parent
+state and receipt-block end. The logical target may not be the wallet itself.
+It rejects a second operation for the active wallet, wallet batching,
+try/delegate modes, installed validator/policy modes, paymasters, account
+deployment, self-calls, unknown EntryPoint versions, unknown account
+implementations, non-canonical ABI, and unsupported wrappers. Direct mode also
+rejects type-4 or nonempty authorization lists and wallet self-calls.
+
+Transaction type is not an identity check: first-use authorization may be type
+4, while an already delegated wallet may later use type 2. The verifier pins
+the receipt block by hash, reconstructs active-wallet EIP-7702 authorizations
+through the target transaction index, and recovers each authorization signer.
+A first-use wallet must have an empty validation storage slot at the parent and
+exactly one reviewed Kernel authorization with the transaction-order nonce.
+Any non-reviewed delegate, prior same-block operation/self-call by the wallet,
+or unprovable EntryPoint call fails closed.
+
+For every mined transaction, the verifier binds the requested transaction and
+receipt to their exact index in the pinned block. For a sponsored transaction,
+it also pins EntryPoint, the EIP-7702 delegation designator, Kernel runtime,
+and zero root validator at the receipt block; recomputes the
+selected UserOperation hash; requires its exact successful
+`UserOperationEvent`; and trusts protocol/transfer logs only after
+`BeforeExecution` or the preceding operation's event and before the selected
+operation's event. Events from unrelated bundled users cannot satisfy a Punk
+Town or acquisition proof.
+
 ### Native BAES acquisition
 
 When `plan-buy`, `plan-stake`, or `plan-upgrade` returns
@@ -65,8 +107,13 @@ fee/impact fields. Get explicit confirmation for its
 `acquisitionAuthorizationKey` before execution. If Bankr cannot expose those
 bounds, stop.
 
+Only native ETH, WETH, and official Base USDC
+(`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`) are accepted as acquisition
+sources. Other ERC-20 contracts can lie about debit semantics in `Transfer`
+logs, so convert another asset to one of these three before continuing.
+
 The direct Wallet API is an exact-input fallback, not an exact-output API. Quote
-exact source amounts until `minBuyAmount` covers the deficit, then run
+exact supported-source amounts until `minBuyAmount` covers the deficit, then run
 `bind-acquisition --mode wallet-api-exact-input` with the fresh quote and
 planner request context. In either mode, the command binds source
 address/decimals, exact or maximum input, BAES floor, slippage, available
@@ -76,14 +123,18 @@ that exact key before one swap.
 
 Bankr may encode native Base ETH as either the zero address or its `0xEeee...`
 sentinel. The binder canonicalizes both to the same authorization, and the
-receipt verifier bounds the native input from transaction `value` instead of an
-ERC-20 `Transfer` log. It does not call that value exact net spend because a
-router may refund unused native input.
+receipt verifier bounds the native input from the wallet's logical call value
+instead of the sponsored outer transaction value, which is normally zero, or an
+ERC-20 `Transfer` log. It does not call that logical value exact net spend
+because a router may refund unused native input.
 
 After Bankr reports `success: true` and a mined hash, run
-`verify-acquisition` with the authorization context/key. It proves the signer,
-successful Base receipt, ERC-20 debit or native transaction-value bound, BAES
-transfer floor, and fresh required balance. Its scope is deliberately
+`verify-acquisition` with the authorization context/key. It proves the logical
+wallet execution, successful sponsored UserOperation when applicable, canonical
+WETH/USDC net debit or logical native-value bound, canonical net BAES transfer
+floor, and fresh required balance. ERC-20 and BAES transfers require exact
+standard topic/data encoding, exclude self-transfers, net opposing flows, and
+are limited to the selected UserOperation's receipt-log window. Its scope is deliberately
 Bankr-managed: it does not claim a local DEX target, router calldata, approval,
 native refund, or exact net native-spend proof. Never pass an acquisition object
 to `inspect-calldata`; it is not Punk Town calldata.
@@ -99,8 +150,10 @@ node scripts/punktown.mjs verify --wallet 0xActiveBankrEvmWallet
 ```
 
 The offline self-test owns encoding, decoding, selector, units, malformed-input,
-and fixture vectors. The live self-test and `verify` own Base deployment
-identity, code hash, peer wiring, open state, asset, route, and adapter checks.
+shared-bundle isolation, and fixture vectors. The live self-test also proves
+Bankr-API-attributed single-user and multi-user EntryPoint receipts; `verify`
+owns the Punk Town Base deployment identity, code hash, peer wiring, open state,
+asset, route, and adapter checks.
 `PUNKTOWN_RPC_URL` takes precedence over `BASE_RPC_URL`. If either override is
 set, the process uses only that endpoint and fails closed on error; it never
 falls through from a local fork or private snapshot to public Base.
@@ -252,12 +305,15 @@ Require:
 1. transaction hash on Base;
 2. mined receipt;
 3. receipt status `success`;
-4. signer equal to the resolved Bankr wallet;
-5. expected event from the expected contract with exact indexed and data
+4. direct sender or selected UserOperation sender equal to the resolved Bankr
+   wallet;
+5. for sponsored execution, pinned receipt-block EntryPoint/Kernel identities
+   and an exact successful `UserOperationEvent`;
+6. expected event from the expected contract with exact indexed and data
    arguments;
-6. fresh state reads proving the operation-specific postcondition in
+7. fresh state reads proving the operation-specific postcondition in
    `operations.md`;
-7. exact token/NFT balance and allowance changes where applicable.
+8. exact token/NFT balance and allowance changes where applicable.
 
 Inspect the submitted hash once it exists:
 
@@ -270,18 +326,21 @@ node scripts/punktown.mjs inspect-tx \
 ```
 
 Use the exact context/key pair that inspected the submitted transaction. This
-command proves the sender and bound envelope, distinguishes pending/unavailable,
-confirmed revert, and confirmed success, decodes recognized Punk Town events,
-and runs operation-specific receipt proofs. A pending/unavailable transaction
+command proves the logical sender and bound inner envelope, distinguishes
+pending/unavailable, confirmed revert, and confirmed success, isolates the
+selected UserOperation's logs, decodes its recognized Punk Town events, and
+runs operation-specific receipt proofs. A pending/unavailable transaction
 returns `ok: false` and exit code `1`; it is not permission to replay. Use the
 read commands below for a concise user-facing summary as well.
 
-If Bankr appends a structurally recognized ERC-8021 schema 0, 1, or 2 attribution suffix,
-`inspect-tx` strips it before recomputing the key over the original core
-calldata. Schema 0/1 codes and registry details are reported; schema 2 CBOR is
-reported as length-bounded opaque attribution and is not semantically decoded.
-Any malformed outer suffix, unknown schema, or other calldata mutation fails
-closed.
+If Bankr appends a structurally recognized ERC-8021 schema 0, 1, or 2
+attribution suffix to direct calldata or to the sponsored Kernel wrapper,
+`inspect-tx` strips it before strict wrapper decoding and recomputes the plan key
+over the original inner call. Schema 0/1 codes and registry details are
+reported; schema 2 CBOR is reported as length-bounded opaque attribution and is
+not semantically decoded. A second nested suffix, malformed suffix, unknown
+schema, or other calldata mutation fails closed. Attribution is metadata, never
+wallet identity.
 
 Use the relevant read command after the receipt:
 

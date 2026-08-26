@@ -19,6 +19,7 @@ jobs:
           node-version: 20
       - name: Syntax check
         run: |
+          node --check scripts/lib/bankr.mjs
           node --check scripts/punktown.mjs
           node --check scripts/selftest.mjs
           node --check scripts/fork-cli-test.mjs
@@ -27,5 +28,6 @@ jobs:
       - name: Parse shipped JSON
         run: |
           jq empty catalog.json
+          jq empty references/bankr-execution.json
           jq empty references/deployment.json
           jq empty references/signing-allowlist.json

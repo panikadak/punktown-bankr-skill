@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { selector } from "./lib/keccak256.mjs";
+import { keccak256, selector } from "./lib/keccak256.mjs";
 
 const SKILL_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = resolve(SKILL_DIR, "scripts/punktown.mjs");
@@ -558,6 +558,11 @@ async function runComprehensiveFlows(boughtTokenId, pendingPlan, pendingHash) {
     boundAcquisition.report.includes(`WETH (${normalizeAddress(WETH)})`),
     boundAcquisition.report,
   );
+  assert(
+    "fallback confirmation displays max price-impact protection",
+    boundAcquisition.report.includes("wallet max price-impact protection 500 bps"),
+    boundAcquisition.report,
+  );
   assert("authorization emits a distinct confirmation key", /^0x[0-9a-f]{64}$/.test(boundAcquisition.acquisitionAuthorizationKey), boundAcquisition.acquisitionAuthorizationKey);
   assert("authorization emits canonical verification context", /^0x(?:[0-9a-f]{2})+$/.test(boundAcquisition.authorizationContextHex), boundAcquisition.authorizationContextHex);
   const nativeAcquisition = await expectCliSuccess("Bankr native exact-output preview binding", [
@@ -613,6 +618,11 @@ async function runComprehensiveFlows(boughtTokenId, pendingPlan, pendingHash) {
     acquisitionBindArgs.map((value, index, values) => values[index - 1] === "--min-baes-out" ? "6599999" : value),
     "acquisition-quote",
   );
+  await expectCliFailure(
+    "acquisition rejects an unverified ERC-20 source",
+    acquisitionBindArgs.map((value, index, values) => values[index - 1] === "--source-token" ? ALT_RECIPIENT : value),
+    "acquisition-quote",
+  );
   const joinConfirmationKey = unfundedJoin.confirmationKey;
   const joinTokenId = unfundedJoin.terms.tokenId;
 
@@ -647,8 +657,44 @@ async function runComprehensiveFlows(boughtTokenId, pendingPlan, pendingHash) {
     "--authorization-key", boundAcquisition.acquisitionAuthorizationKey,
   ]);
   assert("acquisition proof binds exact WETH debit", BigInt(verifiedAcquisition.sourceAmountObserved) === rawAmount("0.01"), verifiedAcquisition);
-  assert("acquisition proof labels ERC-20 debit", verifiedAcquisition.sourceObservation === "erc20-transfer-debit", verifiedAcquisition);
+  assert("acquisition proof labels ERC-20 net debit", verifiedAcquisition.sourceObservation === "erc20-net-transfer-debit", verifiedAcquisition);
   assert("acquisition proof binds minimum BAES receipt", BigInt(verifiedAcquisition.baesReceived) === rawAmount("6600000"), verifiedAcquisition);
+  const unsupportedModeContext = structuredClone(boundAcquisition.authorizationContext);
+  unsupportedModeContext.terms.mode = "unsupported-acquisition-mode";
+  const unsupportedModeKey = keccak256(JSON.stringify({
+    chainId: CHAIN_ID,
+    action: unsupportedModeContext.action,
+    terms: unsupportedModeContext.terms,
+  }));
+  await expectCliFailure("acquisition verifier rejects a crafted unknown mode", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", acquisitionResult.hash,
+    "--authorization-context", utf8Hex(JSON.stringify(unsupportedModeContext)),
+    "--authorization-key", unsupportedModeKey,
+  ], "acquisition-binding");
+  await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: WETH,
+    data: encodeErc20Approve(swapFixture, rawAmount("0.01")),
+  }, "self-transfer fixture WETH approval");
+  await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: BAES,
+    data: encodeErc20Approve(swapFixture, rawAmount("6600000")),
+  }, "self-transfer fixture BAES approval");
+  const fakeSelfSwapData = `${selector("fakeSwapSelf(address,address,uint256,uint256)").slice(2)}`
+    + `${wordAddress(WETH)}${wordAddress(BAES)}${wordUint(rawAmount("0.01"))}${wordUint(rawAmount("6600000"))}`;
+  const fakeSelfSwapResult = await mineRaw({
+    from: MUTATION_RECIPIENT,
+    to: swapFixture,
+    data: `0x${fakeSelfSwapData}`,
+  }, "self-transfer acquisition bypass fixture");
+  await expectCliFailure("acquisition rejects source and BAES self-transfer receipts", [
+    "verify-acquisition", "--wallet", MUTATION_RECIPIENT,
+    "--tx", fakeSelfSwapResult.hash,
+    "--authorization-context", boundAcquisition.authorizationContextHex,
+    "--authorization-key", boundAcquisition.acquisitionAuthorizationKey,
+  ], "acquisition-receipt");
   const nativeFixtureSwapData = `${selector("swapNative(address,uint256)").slice(2)}`
     + `${wordAddress(BAES)}${wordUint(rawAmount("6600000"))}`;
   const nativeAcquisitionResult = await mineRaw({

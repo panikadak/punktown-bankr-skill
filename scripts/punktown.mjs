@@ -19,14 +19,34 @@ import {
 import {
   estimateGas,
   ethCall,
+  getBlockByHash,
   getCode,
+  getCodeHash,
   getReceipt,
+  getStorageAt,
   getTransaction,
+  getTransactionCount,
   latestBlock,
   revertData,
   txSelector,
   unsignedTx,
 } from "./lib/chain.mjs";
+import {
+  ECRECOVER_PRECOMPILE,
+  ENTRY_POINT_V07_CODE_HASH,
+  KERNEL_DELEGATION_DESIGNATOR,
+  KERNEL_IMPLEMENTATION,
+  KERNEL_IMPLEMENTATION_CODE_HASH,
+  KERNEL_VALIDATION_STORAGE_SLOT,
+  ROOT_VALIDATOR_SELECTOR,
+  decodeAuthorizationAuthority,
+  decodeBankrExecution,
+  decodeRootValidator,
+  proveKernelDelegationAtTransaction,
+  sumCanonicalErc20Transfers,
+  userOperationHashCall,
+  verifyBankrExecutionReceipt,
+} from "./lib/bankr.mjs";
 import { keccak256 } from "./lib/keccak256.mjs";
 import {
   ADDR,
@@ -59,10 +79,20 @@ import {
 
 const [, , command, ...argv] = process.argv;
 const BANKR_NATIVE_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const BASE_USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const ZERO_ROOT_VALIDATOR_RESULT = `0x${"0".repeat(64)}`;
 
 function isNativeToken(address) {
   const normalized = normalizeAddress(address);
   return normalized === ZERO_ADDRESS || normalized === BANKR_NATIVE_TOKEN;
+}
+
+function acquisitionSource(address) {
+  const normalized = normalizeAddress(address);
+  if (isNativeToken(normalized)) return { token: BANKR_NATIVE_TOKEN, symbol: "ETH", decimals: 18, kind: "native" };
+  if (normalized === normalizeAddress(ADDR.weth)) return { token: normalized, symbol: "WETH", decimals: 18, kind: "erc20" };
+  if (normalized === BASE_USDC) return { token: normalized, symbol: "USDC", decimals: 6, kind: "erc20" };
+  return null;
 }
 
 const args = {};
@@ -202,6 +232,153 @@ async function simulation(tx, wallet) {
       revertSelector: data?.slice(0, 10) ?? null,
     });
   }
+}
+
+function resolveBankrExecution(transaction, wallet, gateName) {
+  try {
+    return decodeBankrExecution(transaction, wallet);
+  } catch (error) {
+    throw new GateError(gateName, error.message);
+  }
+}
+
+async function proveBankrExecutionReceipt(envelope, transaction, receipt, gateName) {
+  const block = receipt.blockNumber;
+  gate(Boolean(block), gateName, "receipt has no mined block number");
+  gate(Boolean(receipt.blockHash), gateName, "receipt has no mined block hash");
+  gate(/^0x[0-9a-fA-F]{64}$/.test(transaction.hash ?? ""), gateName, "transaction has no canonical hash");
+  gate(/^0x[0-9a-fA-F]{64}$/.test(receipt.transactionHash ?? ""), gateName, "receipt has no canonical transaction hash");
+  gate(transaction.hash?.toLowerCase() === receipt.transactionHash?.toLowerCase(), gateName, "transaction and receipt hashes do not match");
+  const blockNumber = BigInt(block);
+  gate(blockNumber > 0n, gateName, "receipt block has no parent state");
+  const receiptBlock = await getBlockByHash(receipt.blockHash, true);
+  gate(receiptBlock?.hash?.toLowerCase() === receipt.blockHash.toLowerCase(), gateName, "receipt block hash could not be pinned");
+  gate(BigInt(receiptBlock.number) === blockNumber, gateName, "receipt block number does not match its hash");
+  gate(/^0x[0-9a-fA-F]{64}$/.test(receiptBlock.parentHash ?? ""), gateName, "receipt block has no canonical parent hash");
+  gate(transaction.blockHash?.toLowerCase() === receiptBlock.hash.toLowerCase(), gateName, "transaction block hash does not match the receipt block");
+  gate(BigInt(transaction.blockNumber) === blockNumber, gateName, "transaction block number does not match the receipt");
+  const transactionIndex = Number(BigInt(transaction.transactionIndex));
+  gate(Number.isSafeInteger(transactionIndex) && transactionIndex >= 0, gateName, "transaction index is outside the safe integer range");
+  gate(BigInt(receipt.transactionIndex) === BigInt(transaction.transactionIndex), gateName, "transaction and receipt indexes do not match");
+  gate(
+    receiptBlock.transactions?.[transactionIndex]?.hash?.toLowerCase() === transaction.hash.toLowerCase(),
+    gateName,
+    "transaction is not a member of the pinned receipt block at its claimed index",
+  );
+  const receiptBlockRef = { blockHash: receiptBlock.hash, requireCanonical: true };
+  const parentBlockRef = { blockHash: receiptBlock.parentHash, requireCanonical: true };
+  if (envelope.mode === "direct-wallet-transaction") {
+    return {
+      accountKind: envelope.accountKind,
+      transactionProof: {
+        hash: transaction.hash.toLowerCase(),
+        blockHash: receiptBlock.hash.toLowerCase(),
+        blockNumber,
+        transactionIndex,
+      },
+      userOperationEvent: null,
+    };
+  }
+  let entryPointCodeHash;
+  let expectedUserOpHash;
+  let parentWalletCode;
+  let parentWalletNonce;
+  let walletCode;
+  let implementationCodeHash;
+  let endRootValidatorResult;
+  try {
+    [entryPointCodeHash, expectedUserOpHash, parentWalletCode, parentWalletNonce, walletCode, implementationCodeHash, endRootValidatorResult] = await Promise.all([
+      getCodeHash(envelope.entryPoint, receiptBlockRef),
+      ethCall(envelope.entryPoint, userOperationHashCall(envelope), null, receiptBlockRef).then(decodeBytes32),
+      getCode(envelope.logicalSender, parentBlockRef),
+      getTransactionCount(envelope.logicalSender, parentBlockRef),
+      getCode(envelope.logicalSender, receiptBlockRef),
+      getCodeHash(KERNEL_IMPLEMENTATION, receiptBlockRef),
+      ethCall(envelope.logicalSender, ROOT_VALIDATOR_SELECTOR, null, receiptBlockRef),
+    ]);
+  } catch (error) {
+    throw new GateError(gateName, `could not pin sponsored execution state by block hash: ${error.message}`);
+  }
+  gate(entryPointCodeHash === ENTRY_POINT_V07_CODE_HASH, gateName, "supported EntryPoint runtime hash changed", {
+    entryPoint: envelope.entryPoint,
+    expected: ENTRY_POINT_V07_CODE_HASH,
+    actual: entryPointCodeHash,
+  });
+  let userOperationEvent;
+  try {
+    userOperationEvent = verifyBankrExecutionReceipt(envelope, receipt, expectedUserOpHash);
+  } catch (error) {
+    throw new GateError(gateName, error.message);
+  }
+  let parentRootValidator = ZERO_ROOT_VALIDATOR_RESULT;
+  if (parentWalletCode === "0x") {
+    let validationStorage;
+    try {
+      validationStorage = await getStorageAt(
+        envelope.logicalSender,
+        KERNEL_VALIDATION_STORAGE_SLOT,
+        parentBlockRef,
+      );
+    } catch (error) {
+      throw new GateError(gateName, `could not read first-use Bankr validation storage at the parent block: ${error.message}`);
+    }
+    gate(/^0x0{64}$/.test(validationStorage), gateName, "empty-code Bankr wallet retained Kernel validation state at the parent block");
+  } else {
+    try {
+      parentRootValidator = await ethCall(
+        envelope.logicalSender,
+        ROOT_VALIDATOR_SELECTOR,
+        null,
+        parentBlockRef,
+      );
+    } catch (error) {
+      throw new GateError(gateName, `could not read the Bankr root validator at the parent block: ${error.message}`);
+    }
+  }
+  let delegationProof;
+  try {
+    delegationProof = await proveKernelDelegationAtTransaction({
+      wallet: envelope.logicalSender,
+      transaction,
+      block: receiptBlock,
+      parentWalletCode,
+      parentWalletNonce,
+      parentRootValidator,
+      recoverAuthority: async (authorization) => decodeAuthorizationAuthority(await ethCall(
+        ECRECOVER_PRECOMPILE,
+        authorization.callData,
+        null,
+        parentBlockRef,
+      )),
+    });
+  } catch (error) {
+    throw new GateError(gateName, `could not prove transaction-time Bankr delegation: ${error.message}`);
+  }
+  gate(walletCode.toLowerCase() === KERNEL_DELEGATION_DESIGNATOR, gateName, "Bankr EIP-7702 wallet is not delegated to the reviewed Kernel implementation at the receipt block end", {
+    wallet: envelope.logicalSender,
+    observedCode: walletCode,
+  });
+  gate(implementationCodeHash === KERNEL_IMPLEMENTATION_CODE_HASH, gateName, "reviewed Bankr Kernel runtime hash changed", {
+    expected: KERNEL_IMPLEMENTATION_CODE_HASH,
+    actual: implementationCodeHash,
+  });
+  let endRootValidator;
+  try {
+    endRootValidator = decodeRootValidator(endRootValidatorResult);
+  } catch (error) {
+    throw new GateError(gateName, `could not decode the Bankr root validator at receipt-block end: ${error.message}`);
+  }
+  gate(endRootValidator === `0x${"0".repeat(42)}`, gateName, "Bankr wallet rootValidator is nonzero at receipt-block end");
+  return {
+    entryPoint: envelope.entryPoint,
+    entryPointCodeHash,
+    accountKind: envelope.accountKind,
+    implementation: KERNEL_IMPLEMENTATION,
+    implementationCodeHash,
+    endRootValidator,
+    delegationProof,
+    userOperationEvent,
+  };
 }
 
 function confirmationKey(action, terms) {
@@ -390,7 +567,7 @@ async function baesAcquisitionPlan({ action, wallet, required, maxSlippageBps, t
       requestedOutputHuman: formatUnits(deficit, 18),
       requestedOutputMode: "exact-output",
       maxSlippageBps,
-      sourcePolicy: "Prefer an asset the user named. Without one, automatically suggest only sufficient native ETH, WETH, or verified Base USDC and preserve native ETH needed for gas. Any other fungible asset requires an explicit user choice; never auto-sell a tokenized stock, NFT, Crew reward credit, or unrelated asset. Never use another chain, wallet, recipient, or Punk Town's one-way fee adapter.",
+      sourcePolicy: "Use only sufficient native ETH, WETH, or official Base USDC and preserve native ETH needed for gas. If the user names any other asset, explain that this verifier cannot prove its debit semantics and ask them to swap it to ETH, WETH, or Base USDC first. Never auto-sell a tokenized stock, NFT, Crew reward credit, or unrelated asset. Never use another chain, wallet, recipient, or Punk Town's one-way fee adapter.",
       primaryRule: `Use Bankr's native same-chain exact-output swap action for exactly ${formatUnits(deficit, 18)} BAES at the pinned contract address on Base. Invoke the current agent's native swap capability directly; do not recursively call /agent/prompt. Require Bankr's fresh preview to show the source asset, maximum source spend, fees, price impact, exact BAES output, and slippage. Run bind-acquisition in bankr-native-exact-output mode, then obtain explicit confirmation for its concrete acquisitionAuthorizationKey plus the unchanged targetConfirmationKey.`,
       requestBindingRule: `The acquisitionRequestKey ${requestKey} binds the wallet, Base, BAES deficit, slippage ceiling, and target Punk Town plan. It is an integrity request only; it cannot authorize a source asset or spend amount that Bankr has not yet quoted.`,
       fallbackRule: "If native exact-output is unavailable but direct Wallet API access exists, use POST /wallet/swap-quote with exact source amounts until minBuyAmount covers the deficit, then run bind-acquisition in wallet-api-exact-input mode with this request context/key and the fresh quote. Confirm its acquisitionAuthorizationKey before one exact-input POST /wallet/swap. Never treat an estimated output as a floor.",
@@ -434,12 +611,15 @@ async function bindAcquisition() {
   // either spelling to one canonical API/receipt representation so the same
   // preview cannot produce different authorization keys.
   const sourceToken = isNativeToken(requestedSourceToken) ? BANKR_NATIVE_TOKEN : requestedSourceToken;
-  gate(sourceToken !== normalizeAddress(ADDR.baes), "acquisition-quote", "source token cannot be BAES");
-  const sourceSymbol = optionalBoundedTextArg("source-symbol", { maxLength: 32, pattern: /^[A-Za-z0-9._+\- ]+$/ });
-  const sourceDecimals = Number(integerArg("source-decimals", { min: 0n, max: 255n }));
-  if (isNativeToken(sourceToken)) {
-    gate(sourceDecimals === 18, "acquisition-quote", "Base native ETH must use 18 decimals");
+  const source = acquisitionSource(sourceToken);
+  gate(source, "acquisition-quote", "source token must be native ETH, WETH, or official Base USDC on Base");
+  const suppliedSourceSymbol = optionalBoundedTextArg("source-symbol", { maxLength: 32, pattern: /^[A-Za-z0-9._+\- ]+$/ });
+  if (suppliedSourceSymbol !== null) {
+    gate(suppliedSourceSymbol.toUpperCase() === source.symbol, "acquisition-quote", `source symbol must match ${source.symbol} for the bound address`);
   }
+  const sourceSymbol = source.symbol;
+  const sourceDecimals = Number(integerArg("source-decimals", { min: 0n, max: 255n }));
+  gate(sourceDecimals === source.decimals, "acquisition-quote", `${source.symbol} must use ${source.decimals} decimals`);
   const sourceAmount = amountArg("source-amount", sourceDecimals);
   const minBaesOut = amountArg("min-baes-out", 18);
   if (mode === "bankr-native-exact-output") {
@@ -537,11 +717,12 @@ async function bindAcquisition() {
   const authorizationContext = encodeInspectionContext("authorize-baes-acquisition", authorizationTerms);
   // Symbols are caller-supplied display metadata. Always pair them with the
   // canonical address so a misleading symbol cannot hide the asset being sold.
-  const sourceLabel = sourceSymbol ? `${sourceSymbol} (${sourceToken})` : sourceToken;
+  const sourceLabel = `${sourceSymbol} (${sourceToken})`;
   const optionalCosts = [
     feeBps === null ? null : `Bankr fee ${feeBps} bps`,
     priceImpactBps === null ? null : `display price impact ${priceImpactBps} bps`,
     swapImpactBps === null ? null : `fee-exclusive swap impact ${swapImpactBps} bps`,
+    maxPriceImpactBps === null ? null : `wallet max price-impact protection ${maxPriceImpactBps} bps`,
     networkCostsUsd === null ? null : `estimated network cost $${networkCostsUsd}`,
   ].filter(Boolean);
   out({
@@ -581,34 +762,74 @@ async function verifyAcquisition() {
   });
   gate(Number(authorization.chainId) === 8453, "acquisition-binding", "acquisition authorization must stay on Base 8453");
   gate(normalizeAddress(authorization.wallet) === wallet, "acquisition-binding", "active wallet does not match the acquisition authorization");
+  gate(
+    authorization.mode === "bankr-native-exact-output" || authorization.mode === "wallet-api-exact-input",
+    "acquisition-binding",
+    "acquisition authorization mode is unsupported",
+  );
 
   const hash = need("tx").toLowerCase();
   gate(/^0x[0-9a-f]{64}$/.test(hash), "args", "--tx must be a 32-byte transaction hash");
   const [transaction, receipt] = await Promise.all([getTransaction(hash), getReceipt(hash)]);
   gate(transaction && receipt, "acquisition-pending", "acquisition transaction is pending or unavailable; do not retry", { hash });
-  gate(normalizeAddress(transaction.from) === wallet, "acquisition-receipt", "acquisition signer does not match the active Bankr wallet", {
-    expected: wallet,
-    actual: transaction.from,
-  });
+  gate(transaction.hash?.toLowerCase() === hash && receipt.transactionHash?.toLowerCase() === hash, "acquisition-receipt", "RPC transaction or receipt does not match the requested hash", { hash });
+  const actualChainId = Number(BigInt(transaction.chainId));
+  gate(actualChainId === 8453, "acquisition-receipt", "acquisition transaction is not on Base chainId 8453", { actualChainId });
   gate(BigInt(receipt.status) === 1n, "acquisition-receipt", "acquisition transaction mined with a reverted status", { hash });
+  const executionEnvelope = resolveBankrExecution(transaction, wallet, "acquisition-receipt");
+  const executionProof = await proveBankrExecutionReceipt(executionEnvelope, transaction, receipt, "acquisition-receipt");
+  const logicalLogRange = executionProof?.userOperationEvent?.receiptLogRange ?? null;
+  const logicalReceiptLogs = logicalLogRange
+    ? receipt.logs.slice(logicalLogRange.start, logicalLogRange.end)
+    : receipt.logs;
 
   const quote = authorization.quote;
   const sourceToken = normalizeAddress(quote.sourceToken);
+  const source = acquisitionSource(sourceToken);
+  gate(source, "acquisition-binding", "authorized source token is not native ETH, WETH, or official Base USDC on Base");
+  gate(Number(quote.sourceDecimals) === source.decimals, "acquisition-binding", "authorized source token decimals do not match the verified source");
+  gate(String(quote.sourceSymbol).toUpperCase() === source.symbol, "acquisition-binding", "authorized source symbol does not match the verified source");
+  gate(normalizeAddress(quote.outputToken) === normalizeAddress(ADDR.baes), "acquisition-binding", "authorized output token is not pinned BAES");
   const sourceLimit = BigInt(quote.sourceAmount);
   const minBaesOut = BigInt(quote.minBaesOut);
-  const transferTopic = keccak256("Transfer(address,address,uint256)").toLowerCase();
-  const transferred = (token, direction, account) => receipt.logs.reduce((total, log) => {
-    if (normalizeAddress(log.address) !== normalizeAddress(token)) return total;
-    if (log.topics?.[0]?.toLowerCase() !== transferTopic || log.topics.length !== 3) return total;
-    const indexed = normalizeAddress(`0x${log.topics[direction === "from" ? 1 : 2].slice(-40)}`);
-    if (indexed !== account) return total;
-    return total + BigInt(log.data);
-  }, 0n);
-  const baesReceived = transferred(ADDR.baes, "to", wallet);
+  gate(sourceLimit > 0n && minBaesOut > 0n, "acquisition-binding", "authorized source and output bounds must be positive");
+  const expectedSourceAmountMode = authorization.mode === "wallet-api-exact-input" ? "exact-input" : "maximum-input";
+  gate(quote.sourceAmountMode === expectedSourceAmountMode, "acquisition-binding", "authorized source amount mode does not match the acquisition mode");
+  const requestedMinimumBaesOut = BigInt(quote.requestedMinimumBaesOut);
+  gate(requestedMinimumBaesOut > 0n, "acquisition-binding", "requested BAES output must be positive");
+  if (authorization.mode === "bankr-native-exact-output") {
+    gate(minBaesOut === requestedMinimumBaesOut, "acquisition-binding", "native exact-output authorization does not bind the requested BAES amount exactly");
+    gate(quote.idempotencyKey === null, "acquisition-binding", "native exact-output authorization must not carry a Wallet API idempotency key");
+  } else {
+    gate(minBaesOut >= requestedMinimumBaesOut, "acquisition-binding", "Wallet API authorization minimum does not cover the requested BAES amount");
+    gate(typeof quote.idempotencyKey === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(quote.idempotencyKey), "acquisition-binding", "Wallet API authorization has no canonical UUID idempotency key");
+  }
+  let baesReceived;
+  let sourceAmountObserved;
+  try {
+    const baesIncoming = sumCanonicalErc20Transfers(logicalReceiptLogs, ADDR.baes, "to", wallet);
+    const baesOutgoing = sumCanonicalErc20Transfers(logicalReceiptLogs, ADDR.baes, "from", wallet);
+    gate(baesIncoming >= baesOutgoing, "acquisition-receipt", "acquisition has no positive net BAES transfer to the wallet", {
+      baesIncoming,
+      baesOutgoing,
+    });
+    baesReceived = baesIncoming - baesOutgoing;
+    if (source.kind === "native") {
+      sourceAmountObserved = executionEnvelope.logicalCall.value;
+    } else {
+      const sourceOutgoing = sumCanonicalErc20Transfers(logicalReceiptLogs, sourceToken, "from", wallet);
+      const sourceIncoming = sumCanonicalErc20Transfers(logicalReceiptLogs, sourceToken, "to", wallet);
+      gate(sourceOutgoing >= sourceIncoming, "acquisition-receipt", "acquisition has no positive net source-token debit", {
+        sourceOutgoing,
+        sourceIncoming,
+      });
+      sourceAmountObserved = sourceOutgoing - sourceIncoming;
+    }
+  } catch (error) {
+    if (error instanceof GateError) throw error;
+    throw new GateError("acquisition-receipt", `receipt transfer proof is malformed: ${error.message}`);
+  }
   const nativeSource = isNativeToken(sourceToken);
-  const sourceAmountObserved = nativeSource
-    ? BigInt(transaction.value ?? 0)
-    : transferred(sourceToken, "from", wallet);
   gate(sourceAmountObserved > 0n, "acquisition-receipt", "acquisition receipt does not prove any bound source input");
   gate(sourceAmountObserved <= sourceLimit, "acquisition-receipt", "acquisition source input exceeded the confirmed bound", {
     sourceAmountObserved,
@@ -639,9 +860,19 @@ async function verifyAcquisition() {
     blockNumber: BigInt(receipt.blockNumber),
     wallet,
     mode: authorization.mode,
+    executionMode: executionEnvelope.mode,
+    logicalTarget: executionEnvelope.logicalCall.target,
+    outerFrom: executionEnvelope.outer.from,
+    outerTarget: executionEnvelope.outer.target,
+    executionProof,
+    logicalReceiptLogRange: logicalLogRange,
     sourceToken,
     sourceAmountObserved,
-    sourceObservation: nativeSource ? "native-transaction-value-sent" : "erc20-transfer-debit",
+    sourceObservation: nativeSource
+      ? executionEnvelope.mode === "direct-wallet-transaction"
+        ? "native-transaction-value-sent"
+        : "native-logical-call-value-sent"
+      : "erc20-net-transfer-debit",
     sourceLimit,
     baesReceived,
     minBaesOut,
@@ -650,7 +881,7 @@ async function verifyAcquisition() {
     acquisitionAuthorizationKey: computedAuthorizationKey,
     targetAction: authorization.targetAction,
     targetConfirmationKey: authorization.targetConfirmationKey,
-    proofScope: "Bankr-managed swap envelope plus ERC-20 debit or native transaction-value bound, BAES transfer floor, and fresh balance; no local DEX target, router calldata, approval, native refund, or net-spend claim",
+    proofScope: "Exactly one supported Bankr wallet execution, its successful EntryPoint user operation when sponsored, canonical ERC-20 net debit or logical-call native-value bound, net BAES transfer floor, and fresh balance; no local DEX target, router calldata, approval, native refund, or exact native net-spend claim",
     next: "Run the exact resume planner command from the original acquire-baes output. Continue only if it no longer requests acquisition and its targetConfirmationKey remains unchanged.",
   });
 }
@@ -2194,22 +2425,28 @@ async function inspectTx() {
   gate(/^0x[0-9a-fA-F]{64}$/.test(hash), "args", "--tx must be a 32-byte transaction hash");
   const [tx, receipt] = await Promise.all([getTransaction(hash), getReceipt(hash)]);
   gate(tx, "transaction", "transaction was not found on Base");
-  const target = tx.to ? normalizeAddress(tx.to) : null;
+  gate(tx.hash?.toLowerCase() === hash.toLowerCase(), "transaction", "RPC transaction does not match the requested hash");
+  if (receipt) {
+    gate(receipt.transactionHash?.toLowerCase() === hash.toLowerCase(), "transaction", "RPC receipt does not match the requested hash");
+  }
+  const actualChainId = Number(BigInt(tx.chainId));
+  gate(actualChainId === 8453, "chain", "submitted transaction is not on Base chainId 8453", { actualChainId });
+  const executionEnvelope = resolveBankrExecution(tx, wallet, "execution-envelope");
+  const target = executionEnvelope.logicalCall.target;
   let receiptInput;
   try {
-    receiptInput = stripErc8021Suffix(tx.input);
+    receiptInput = stripErc8021Suffix(executionEnvelope.logicalCall.data);
   } catch (error) {
     throw new GateError("calldata-suffix", error.message);
   }
+  gate(!(executionEnvelope.attribution && receiptInput.attribution), "calldata-suffix", "multiple ERC-8021 attribution suffixes make the logical call ambiguous");
+  const attribution = executionEnvelope.attribution ?? receiptInput.attribution;
   const dataSelector = txSelector(receiptInput.calldata);
   const action = target ? knownActionBySelector(target, dataSelector) : null;
   gate(action, "allowlist", "transaction target/selector is not a recognized Punk Town user operation", { target, selector: dataSelector });
   const decodedArgs = decodeKnownAction(action, receiptInput.calldata);
-  const from = normalizeAddress(tx.from);
-  gate(from === wallet, "signer", "transaction sender does not match --wallet", { from, wallet });
-  const actualChainId = Number(BigInt(tx.chainId));
-  const actualValue = normalizedUintString(tx.value, "transaction value");
-  gate(actualChainId === 8453, "chain", "submitted transaction is not on Base chainId 8453", { actualChainId });
+  const from = executionEnvelope.logicalSender;
+  const actualValue = normalizedUintString(executionEnvelope.logicalCall.value, "logical call value");
   gate(actualValue === "0", "value", "Punk Town write transactions must carry zero native value", { actualValue });
   const computedInspectionKey = inspectionKey(wallet, {
     to: target,
@@ -2238,22 +2475,60 @@ async function inspectTx() {
       action,
       selector: dataSelector,
       from,
+      executionMode: executionEnvelope.mode,
+      outerFrom: executionEnvelope.outer.from,
+      outerTarget: executionEnvelope.outer.target,
       decodedArgs,
       inspectionContext: parsedContext.context,
       inspectionKey: computedInspectionKey,
-      attribution: receiptInput.attribution,
+      attribution,
       next: "This is not completion. Do not submit another write or replay the intent; wait for this exact hash to reach a confirmed receipt.",
     }, 1);
     return;
   }
-  const recognizedEvents = receipt.logs.map(decodeRecognizedLog).filter(Boolean);
   const success = BigInt(receipt.status) === 1n;
+  let recognizedEvents = [];
+  let logicalReceiptLogRange = null;
   let postconditions = [];
+  let executionProof = null;
   if (success) {
     try {
-      postconditions = await durableReceiptProof(action, target, decodedArgs, from, receipt, recognizedEvents, parsedContext.context);
+      executionProof = await proveBankrExecutionReceipt(executionEnvelope, tx, receipt, "execution-receipt");
+      logicalReceiptLogRange = executionProof?.userOperationEvent?.receiptLogRange ?? null;
+      const logicalReceiptLogs = logicalReceiptLogRange
+        ? receipt.logs.slice(logicalReceiptLogRange.start, logicalReceiptLogRange.end)
+        : receipt.logs;
+      recognizedEvents = logicalReceiptLogs.map(decodeRecognizedLog).filter(Boolean);
+      postconditions.push({
+        name: executionEnvelope.mode === "direct-wallet-transaction"
+          ? "direct wallet sender envelope"
+          : "Bankr EntryPoint user operation succeeded",
+        pass: true,
+        actual: executionEnvelope.mode,
+        expected: "supported single logical wallet call",
+      });
     } catch (error) {
-      postconditions = [{ name: "durable receipt proof", pass: false, actual: error.message, expected: "all bound events decodable" }];
+      postconditions.push({
+        name: "Bankr logical execution receipt",
+        pass: false,
+        actual: error.message,
+        expected: "supported single logical wallet call with a successful sponsored UserOperationEvent",
+      });
+    }
+    if (postconditions.every((check) => check.pass)) {
+      try {
+        postconditions.push(...await durableReceiptProof(
+          action,
+          target,
+          decodedArgs,
+          from,
+          receipt,
+          recognizedEvents,
+          parsedContext.context,
+        ));
+      } catch (error) {
+        postconditions.push({ name: "durable receipt proof", pass: false, actual: error.message, expected: "all bound events decodable" });
+      }
     }
   }
   const proven = success && postconditions.every((check) => check.pass);
@@ -2267,13 +2542,18 @@ async function inspectTx() {
     action,
     selector: dataSelector,
     from,
+    executionMode: executionEnvelope.mode,
+    outerFrom: executionEnvelope.outer.from,
+    outerTarget: executionEnvelope.outer.target,
+    executionProof,
+    logicalReceiptLogRange,
     decodedArgs,
     inspectionContext: parsedContext.context,
     inspectionKey: computedInspectionKey,
-    attribution: receiptInput.attribution,
+    attribution,
     recognizedEvents,
     postconditions,
-    proofScope: "durable receipt envelope and events; operation-specific fresh state read remains required",
+    proofScope: "supported single Bankr wallet execution, successful sponsored user operation when applicable, and durable Punk Town receipt events; operation-specific fresh state read remains required",
     receiptStatus: receipt.status,
     next: proven ? "Durable receipt envelope and expected events passed. Run the operation-specific fresh read command before reporting full completion or starting a dependent write." : success ? "Do not call this complete or submit another write; inspect the failed receipt proof and recover from fresh chain state." : "Do not replay automatically. Re-plan from current chain state and diagnose the revert.",
   }, proven ? 0 : 1);

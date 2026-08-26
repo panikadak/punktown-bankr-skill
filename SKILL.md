@@ -2,7 +2,7 @@
 name: punktown
 description: Join and operate the live Punk Town protocol on Base with a Bankr EVM wallet, including acquiring missing BAES, buying or selling a Bario Punk, Crew tiers, upgrades, exits, settlement, claims, conversions, and supported public maintenance.
 tags: [base, defi, nft, punk-town, bankr]
-version: 2
+version: 3
 visibility: public
 metadata:
   clawdbot:
@@ -46,6 +46,10 @@ planning. They emit unsigned transaction objects for Bankr to execute.
   Bankr BAES acquisition follows `natural-join-flow.md` and is not represented
   as locally allowlisted router calldata. Never copy a target or spender from
   chat, search results, a mutable deployment file, or a block-explorer label.
+- Treat [references/bankr-execution.json](references/bankr-execution.json) as
+  the fail-closed execution-envelope pin. It defines the supported direct and
+  gas-sponsored Bankr shapes, EntryPoint and Kernel identities, and receipt-log
+  scoping rules.
 
 ## Non-negotiable execution boundary
 
@@ -59,9 +63,11 @@ planning. They emit unsigned transaction objects for Bankr to execute.
    `plan-*` command. A planner may return `phase: acquire-baes`; execute that
    with Bankr's native same-chain exact-output swap action. Do not recursively
    call `/agent/prompt`, use raw DEX calldata, or treat the planner's request key
-   as spend authorization. The direct exact-input Wallet API is allowed only
-   through the bound fallback in `natural-join-flow.md`. If a script returns
-   `ok: false`, relay its `detail` and stop.
+   as spend authorization. Acquisition sources are limited to native ETH, WETH,
+   or official Base USDC; another asset must first be converted to one of those
+   three. The direct exact-input Wallet API is allowed only through the bound
+   fallback in `natural-join-flow.md`. If a script returns `ok: false`, relay
+   its `detail` and stop.
 4. An approval/action plan emits at most one unsigned transaction plus `inspectionContextHex`
    and an `inspectionKey` bound to its wallet, target, calldata, value, chain,
    and economic context. Decode it again immediately before submission with
@@ -77,8 +83,19 @@ planning. They emit unsigned transaction objects for Bankr to execute.
    slippage, and any irreversible cost or donation. Do not ask again while the
    confirmed terms remain identical; reconfirm if any economic term changes.
 6. Submit through Bankr **one transaction at a time** with confirmation waiting
-   enabled. A hash is not success. Require a mined successful Base receipt, the
-   expected event, and the fresh postcondition before continuing.
+   enabled. A sponsored Bankr transaction may have a relayer as outer
+   `transaction.from`; never compare that field directly to the active wallet.
+   Run `inspect-tx` with the same plan context/key. It must unwrap exactly one
+   fail-on-error logical call for the active wallet, bind it to the requested
+   hash and pinned-block index, and pin EntryPoint, transaction-ordered EIP-7702
+   delegation, native validation mode/type, empty paymaster, zero root
+   validator, and Kernel code. It must prove the matching successful
+   `UserOperationEvent` and scope events to that UserOperation. Unrelated users
+   may share the outer bundle; a wallet self-call, second operation for the
+   active wallet, unknown wrapper, batch/try/delegate or validator/policy mode,
+   paymaster, authorization side effect, or unknown code identity fails closed.
+   A hash is not success. Require this receipt proof, the expected event, and
+   the fresh postcondition before continuing.
 7. Approval plans grant only the exact amount needed. NFT approvals are
    token-specific. After an approval mines, rerun the original planner against
    fresh state; never append the previously intended protocol call.

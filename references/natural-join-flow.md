@@ -66,19 +66,21 @@ but the wallet does not hold the required BAES. Its acquisition request fixes:
 - the balance and final-action request bindings;
 - the exact command to resume after success.
 
-Use the authenticated Base portfolio to find a supported funding asset. Respect
-an asset the user already named. Without one, automatically suggest only a
-sufficient native ETH, WETH, or verified Base USDC balance and keep enough
-native ETH for gas. Any other fungible token requires an explicit user choice;
-never auto-sell tokenized stock, another NFT, or a Crew reward credit. Do not
-bridge from another chain or change wallets.
+Use the authenticated Base portfolio to find a supported funding asset. The
+only sources this skill can bind and prove are native ETH, WETH, and official
+Base USDC (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`). Keep enough native ETH
+for gas. If the user names any other asset, explain that its debit semantics are
+outside this verifier and ask them to swap it to one of those three sources
+first. Never auto-sell tokenized stock, another NFT, or a Crew reward credit.
+Do not bridge from another chain or change wallets.
 
 Bankr may represent native Base ETH as either the zero address or its
 `0xEeee...` native-token sentinel. `bind-acquisition` canonicalizes both to the
 Bankr sentinel, and `verify-acquisition` proves the bounded native input from
-the mined transaction value rather than looking for an ERC-20 `Transfer` log.
-That value is conservative: a router refund can make the wallet's eventual net
-spend lower, so the verifier does not claim an exact net native-ETH debit.
+the wallet's logical call value rather than the sponsored outer transaction
+value, which is normally zero, or an ERC-20 `Transfer` log. That logical value
+is conservative: a router refund can make the wallet's eventual net spend
+lower, so the verifier does not claim an exact net native-ETH debit.
 
 `acquisitionRequestKey` is an integrity binding, not authorization to spend an
 unknown token. Ask Bankr's native exact-output action for a fresh concrete
@@ -113,9 +115,9 @@ node scripts/punktown.mjs bind-acquisition \
   --request-context 0xAcquisitionRequestContextHex \
   --request-key 0xAcquisitionRequestKey \
   --mode wallet-api-exact-input \
-  --source-token 0xQuotedBaseToken \
-  --source-symbol TOKEN \
-  --source-decimals N \
+  --source-token 0x4200000000000000000000000000000000000006 \
+  --source-symbol WETH \
+  --source-decimals 18 \
   --source-amount EXACT_INPUT \
   --min-baes-out QUOTED_MINIMUM \
   --idempotency-key UUID \
@@ -140,12 +142,15 @@ node scripts/punktown.mjs verify-acquisition \
   --authorization-key 0xAcquisitionAuthorizationKey
 ```
 
-This checks the Base signer and successful receipt, ERC-20 source debit or
-native transaction value against the confirmed exact/maximum input, BAES
-`Transfer` delivery against the floor, and the fresh required BAES balance. It
-deliberately makes no claim about Bankr's managed router, calldata, token
-approval, native refund, or exact net native spend. Then run the planner's exact
-resume command; that fresh planner is the authoritative target-action state.
+This checks the direct sender or selected sponsored UserOperation sender, its
+successful Base execution, canonical WETH/USDC net debit or logical native
+value against the confirmed exact/maximum input, net BAES `Transfer` delivery
+against the floor, and the fresh required BAES balance. Self-transfers and
+out-and-back transfer amounts do not count. In a shared EntryPoint bundle, only the
+active wallet's selected UserOperation log window counts. It deliberately makes
+no claim about Bankr's managed router, calldata, token approval, native refund,
+or exact net native spend. Then run the planner's exact resume command; that
+fresh planner is the authoritative target-action state.
 
 If it still returns `acquire-baes`, stop and show the remaining shortfall. One
 confirmation authorizes one concrete acquisition attempt, not an unbounded

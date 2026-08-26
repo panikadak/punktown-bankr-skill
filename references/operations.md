@@ -92,8 +92,11 @@ planner is rerun.
    confirmation for the whole unchanged operation.
 5. Decode the emitted transaction again with `inspect-calldata` immediately
    before Bankr submission.
-6. Submit one transaction with confirmation waiting enabled. Require a mined
-   successful receipt, expected event, and fresh state postcondition.
+6. Submit one transaction with confirmation waiting enabled, then run
+   `inspect-tx` with the same context/key. Require its direct-sender or selected
+   sponsored UserOperation proof, expected event from that operation's isolated
+   log window, and fresh state postcondition. Never treat a bundler relayer's
+   outer `transaction.from` as the wallet.
 7. If the emitted transaction was an approval, rerun the original planner. The
    final call must use a fresh head, quote, deadline, allowance, and simulation.
 8. If the planner has more bounded work (`settle-all` or `claim-all`), rerun it

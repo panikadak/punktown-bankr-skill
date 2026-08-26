@@ -19,7 +19,7 @@ does not claim inclusion in Bankr's curated catalog.
 | Rewards | Inspect lifetime distributed tokens, settle one/all, strict claim, batch claim, claim all, explicit lossy claim, explicit credit forfeiture |
 | Stock engine | Inspect pot/bootstrap/rotation, permissionless convert, poke bootstrap, WETH top-up |
 | Desk maintenance | BAES reserve top-up, donation sync, verifiably unowned-head eviction |
-| Safety | Deployment/code-hash/wiring verification, exact approvals, local calldata allowlist, simulation, receipt/event/postcondition checks |
+| Safety | Deployment/code-hash/wiring verification, exact approvals, local calldata allowlist, simulation, direct and EIP-7702/EntryPoint receipt proofs, event/postcondition checks |
 
 Owner-only configuration, pause, roster, recovery, or dust-sweep calls are
 deliberately outside the skill. It contains no governance, role, multisig,
@@ -71,9 +71,10 @@ Convert 0.01 WETH from the Punk Town pot into the next rotation stock.
 
 For the composite join request, the agent checks the current FIFO Punk and BAES
 balance. If BAES is short, it previews a Bankr-native exact-output swap, binds
-the concrete source and maximum spend, confirms it, verifies the mined receipt,
-buys the Punk, and only then asks which Crew tier the user wants. The user does
-not need to name approvals, routes, or contract methods.
+the concrete ETH, WETH, or official Base USDC source and maximum spend, confirms
+it, verifies the mined receipt, buys the Punk, and only then asks which Crew
+tier the user wants. The user does not need to name approvals, routes, or
+contract methods.
 
 For every flow, the agent resolves the active wallet, runs the deterministic
 planner, presents a complete confirmation for each fresh economic step, and
@@ -140,6 +141,17 @@ prepared before an approval or another state-changing transaction.
 Pass the same fresh plan's `inspectionContextHex` and `inspectionKey` to both
 inspection commands. The key binds wallet, target, calldata, value, Base chain,
 and the canonical action terms; changing any of them fails the binding check.
+Bankr's gas-sponsored Base execution places the wallet's logical call inside
+EntryPoint `handleOps`; the outer transaction sender is then a relayer, not the
+user's wallet. `inspect-tx` unwraps the pinned Kernel EIP-7702 single call,
+selects exactly one UserOperation for the active wallet even when the bundler
+includes unrelated users, requires native mode/type `0x00/0x00`, no paymaster,
+zero root validator, and transaction-ordered reviewed delegation, proves its
+successful EntryPoint event, and trusts only that operation's receipt-log
+window. Unknown wrappers or code identities, wallet self-calls, batches,
+try/delegate modes, validator/policy modes, paymasters, and a second operation
+for the same wallet fail closed. Direct wallet transactions remain supported
+without type-4 authorization side effects.
 
 ## Safety model
 
@@ -148,15 +160,22 @@ and the canonical action terms; changing any of them fails the binding check.
   and the stock adapter discovered through `StockLock.stockAdapter()`.
 - Every signing target, approval spender, function selector, and ABI is local
   and allowlisted for Punk Town calls. Bankr-managed acquisition is kept outside
-  that claim: its concrete source/output bounds and receipt transfers are
-  verified, but this skill does not claim Bankr's router calldata or approvals
-  are locally allowlisted. User messages, websites, explorer labels, and mutable
-  remote manifests are not address sources.
+  that claim: only ETH, WETH, or official Base USDC source bounds plus canonical
+  BAES receipt transfers are verified, but this skill does not claim Bankr's
+  router calldata or approvals are locally allowlisted. User messages,
+  websites, explorer labels, and mutable remote manifests are not address
+  sources.
 - BAES and WETH approvals are exact. Bario Punk approvals are token-specific.
   Unlimited or operator-wide approvals are not used.
 - Every Punk Town raw-call transaction is locally simulated and decoded again
   before Bankr submission. Every mined receipt is followed by the applicable
   transfer, event, and fresh-state checks.
+- Receipts are bound to the requested hash and exact pinned-block index.
+  Sponsored receipts additionally pin EntryPoint, the wallet's transaction-time
+  EIP-7702 delegation, zero Kernel root validator, empty paymaster, and Kernel
+  implementation. Punk Town events and acquisition transfers are scoped to the
+  active wallet's selected UserOperation rather than the entire shared bundler
+  receipt.
 - An ambiguous outcome is never retried blindly. The chain is re-read and a new
   plan is built.
 - `claimLossy`, `forfeitCredit`, BAES reserve top-ups, and WETH pot top-ups are
@@ -182,6 +201,7 @@ catalog.json                      Bankr catalog metadata
 logo.svg                          Square catalog mark
 references/deployment.json        Reviewed Base deployment and code identities
 references/signing-allowlist.json Reviewed signing targets and ABI surface
+references/bankr-execution.json   Reviewed Bankr execution-envelope identities
 references/operations.md          Complete protocol-operation playbook
 references/bankr-execution.md     Bankr execution and recovery procedure
 references/natural-join-flow.md   Missing-BAES onboarding and tier handoff
@@ -210,11 +230,12 @@ Both fork suites require an archive-capable Base RPC. The JavaScript harness
 uses `base-forge` to compile its test-only swap receipt fixture, then spawns and
 terminates its own `base-anvil` child on a random local port. The Foundry suite
 must use Base-aware Foundry because the live BAES token uses Base's native-token
-opcode. The fixture proves the local quote binding and onchain transfer checks;
-it does not impersonate the production Bankr backend. Also validate `SKILL.md`
-with the current Bankr skill format before publishing or updating. Do not tag or
-announce a version that has not passed the offline, live-identity, and Base-fork
-checks.
+opcode. The fork fixture proves local quote binding and onchain transfer checks;
+it does not impersonate the production Bankr backend. The live self-test also
+decodes Bankr-API-attributed single-user and shared-bundle Base transactions and
+proves their selected UserOperation receipts. Also validate `SKILL.md` with the
+current Bankr skill format before publishing or updating. Do not tag or announce
+a version that has not passed the offline, live-identity, and Base-fork checks.
 
 Current Bankr behavior is grounded in the official [exact-output swap
 guide](https://docs.bankr.bot/features/trading/swaps/), [Wallet Swap
